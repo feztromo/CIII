@@ -1,0 +1,16 @@
+{
+  "name": "ciii",
+  "version": "0.5.1",
+  "type": "module",
+  "private": true,
+  "bin": { "c3": "./c3.js" },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "ignore": "^6.0.0",
+    "ws": "^8.18.0",
+    "yjs": "^13.6.21"
+  },
+  "optionalDependencies": {
+    "nat-api": "^3.1.0"
+  }
+}
