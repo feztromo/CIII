@@ -249,15 +249,17 @@ const touched = new Set()
 let backend = null
 
 function applyDiff(t, next) {
-  const cur = t.toString()
-  if (cur === next) return false
-  let s = 0
-  while (s < cur.length && s < next.length && cur[s] === next[s]) s++
-  let e = 0
-  while (e < cur.length - s && e < next.length - s && cur[cur.length - 1 - e] === next[next.length - 1 - e]) e++)
-  if (cur.length - s - e > 0) t.delete(s, cur.length - s - e)
-  if (next.length - s - e > 0) t.insert(s, next.slice(s, next.length - e))
-  return true
+  const cur = t.toString();
+  if (cur === next) return false;
+  let s = 0;
+  while (s < cur.length && s < next.length && cur[s] === next[s]) s++;
+  let e = 0;
+  while (e < cur.length - s && e < next.length - s && cur[cur.length - 1 - e] === next[next.length - 1 - e]) {
+    e++;
+  }
+  if (cur.length - s - e > 0) t.delete(s, cur.length - s - e);
+  if (next.length - s - e > 0) t.insert(s, next.slice(s, next.length - e));
+  return true;
 }
 
 function syncFromDisk(rel, seed = false) {
