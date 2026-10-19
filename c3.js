@@ -6,6 +6,11 @@
 //   node c3.js connect
 // Node 22+.
 
+process.on('warning', (w) => {
+  if (w.name === 'ExperimentalWarning' && w.message.includes('localStorage')) return
+  console.warn(w)
+})
+
 import * as Y from 'yjs'
 import chokidar from 'chokidar'
 import ignore from 'ignore'
