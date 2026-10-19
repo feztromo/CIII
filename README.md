@@ -12,7 +12,7 @@ Clone it into your project and set it up once, then connect. When you leave it c
 ```bash
 # 1. Clone it into your project
 cd my-project
-git clone https://github.com/you/ciii.git c3
+git clone https://github.com/feztromo/ciii.git c3
 echo "c3/" >> .gitignore
 
 # 2. Install (once)
