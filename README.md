@@ -9,10 +9,9 @@ No dedicated host or port forwarding is required. Peers discover each other thro
 ## Quick start
 
 ```bash
-# Clone into your project
-cd my-project
+# Clone into your project 
+cd my-project && echo c3/ >> .gitignore
 git clone https://github.com/feztromo/ciii.git c3
-echo c3/ >> .gitignore
 
 # Install dependencies
 cd c3 && npm install
@@ -27,7 +26,7 @@ node c3.js connect
 Share the session name and key outside of CIII.
 
 ```bash
-node c3.js connect --name "myproject" --key <key>
+node c3.js connect --name "my_project" --key <key>
 ```
 
 Anyone using the same name and key joins the same session. If already configured, `node c3.js connect` is enough.
@@ -43,7 +42,7 @@ Anyone using the same name and key joins the same session. If already configured
 
 ## Saving work
 
-Choose an archive backend during configuration.
+Choose a backend archive during configuration.
 
 | Backend | Behaviour |
 |---|---|
@@ -72,7 +71,7 @@ When the last peer leaves, CIII offers to archive the session. If others are sti
 ## File layout
 
 ```
-my-project/
+my_project/
 ├── .git/
 ├── src/
 ├── c3/                 <-- cloned repo
