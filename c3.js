@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env NODE_NO_WARNINGS=1 node
 // CIII (c3) -- P2P live session (git | folder | none).
 // Clone this folder into your project, add "c3/" to .gitignore, then:
 //   npm install
