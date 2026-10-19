@@ -2,7 +2,6 @@
 
 > If things don't work, think of trying to look inside a coconut without breaking it. That's what CoCoCode is.
 
----
 
 Live coding with your team. No central server. Use it on the same Wi-Fi or over the internet.
 
