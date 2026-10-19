@@ -2,84 +2,74 @@
 
 > If things don't work, think of trying to look inside a coconut without breaking it. That's what CoCoCode is.
 
+CIII is a peer-to-peer tool for collaborative coding. It uses WebRTC to sync files between teammates on Windows, Linux, and macOS.
 
-Live coding with your team. No central server. Use it on the same Wi-Fi or over the internet.
-
-Clone it into your project and set it up once, then connect. When you leave it can save your work to git or a folder.
+No dedicated host or port forwarding is required. Peers discover each other through signaling servers and connect directly.
 
 ## Quick start
 
 ```bash
-# 1. Clone it into your project
+# Clone into your project
 cd my-project
 git clone https://github.com/feztromo/ciii.git c3
 echo c3/ >> .gitignore
 
-# 2. Install (once)
+# Install dependencies
 cd c3 && npm install
 
-# 3. Set it up (interactive wizard)
+# Configure and connect
 node c3.js config
-
-# 4. Connect
 node c3.js connect
 ```
 
 ## Invite others
 
-**Same Wi-Fi:** nothing extra needed.
+Share the session name and key outside of CIII.
 
 ```bash
-node c3.js connect   # finds peers automatically
-```
-
-**Remote peers:** share your session key. If you use a relay then share its URL too.
-
-```bash
-# You run this (or host relay.js on a VPS)
-node c3.js connect
-
-# They run this
 node c3.js connect --name "myproject" --key <key>
 ```
 
-If you have a public IP or a router with UPnP your laptop becomes a relay by itself. If not you can run `node relay.js` on any VPS. A VPS is just a rented server.
+Anyone using the same name and key joins the same session. If already configured, `node c3.js connect` is enough.
 
 ## Commands
 
-| Command | What it does |
-|---------|--------------|
-| `node c3.js config` | Pick an archive backend and set a name and key |
-| `node c3.js connect` | Start or join a session |
-| `node c3.js export [dir]` | Copy the current files to a folder |
-| `node c3.js doctor` | Check your setup and connection |
+| Command | Description |
+|---|---|
+| `node c3.js config` | Configure session and archive settings |
+| `node c3.js connect` | Join or start a session |
+| `node c3.js export [dir]` | Export files to a directory |
+| `node c3.js doctor` | Check setup and connectivity |
 
-## Archive backends
+## Saving work
 
-| Backend | What happens when you leave |
-|---------|-----------------------------|
-| `git` | Commits and pushes to origin |
-| `folder` | Saves a dated copy in `/path/to/folder/snapshots/` |
-| `none` | Nothing is saved. Use `export` to keep a copy |
+Choose an archive backend during configuration.
 
-## Environment variables
+| Backend | Behaviour |
+|---|---|
+| `git` | Commits and pushes to `origin` |
+| `folder` | Saves timestamped snapshots to a directory |
+| `none` | Does not save automatically |
 
-| Variable | What it does |
-|----------|--------------|
-| `C3_KEY` | Session key so you are not asked for it |
-| `C3_SIGNALING` | Relay URLs split by commas |
-| `C3_VERBOSE=1` | Show all debug output |
-| `C3_NO_LAN=1` | Turn off LAN discovery |
-| `C3_NO_UPNP=1` | Turn off UPnP port mapping |
+When the last peer leaves, CIII offers to archive the session. If others are still connected, the state remains local and is restored on the next run.
+
+## Configuration
+
+| Variable | Description |
+|---|---|
+| `C3_KEY` | Set the session key through the environment |
+| `C3_SIGNALING` | Additional signaling URLs, comma-separated |
+| `C3_VERBOSE=1` | Enable debug output |
 
 ## How it works
 
-- **LAN:** Peers find each other with a UDP broadcast and connect directly over WebSocket.
-- **Internet:** It connects to all known relays at once. Peers also share their relay lists.
-- **Sync:** Edits sync with Yjs (a CRDT). Everything is encrypted with AES-256-GCM.
-- **Safety:** Every file path and symlink is checked before anything is written to disk.
+- **Discovery:** Signaling servers find peers using a shared room hash.
+- **Sync:** WebRTC data channels sync edits using Yjs.
+- **Encryption:** Session traffic is encrypted end to end using the session key. Signaling servers do not receive file contents.
+- **Networking:** ICE and STUN handle connection setup across networks. Direct connections may fail on restrictive networks. TURN can be configured as a relay.
+- **File safety:** Paths and symlinks are checked, and oversized or unsafe writes are rejected.
 
-## File layout (after clone)
+## File layout
 
 ```
 my-project/
@@ -87,7 +77,6 @@ my-project/
 ├── src/
 ├── c3/                 <-- cloned repo
 │   ├── c3.js           <-- main tool
-│   ├── relay.js        <-- optional public relay
 │   ├── package.json
 │   └── .c3/            <-- created when you run it
 │       ├── config.json
@@ -98,4 +87,11 @@ my-project/
 │           └── state.gen
 ```
 
-Nothing in `c3/` is tracked by your main repo. Add `c3/` to `.gitignore`.
+Add `c3/` to your project's `.gitignore`. Its configuration and session state are stored in `c3/.c3/`.
+
+## Troubleshooting
+
+- Run `node c3.js doctor`.
+- Verify that all peers use the same session name and key.
+- Make sure `npm install` completed successfully.
+- If direct WebRTC connections fail on a restrictive network, configure a TURN relay.
