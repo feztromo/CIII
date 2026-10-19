@@ -451,8 +451,17 @@ async function connect() {
     } catch {}
   }
 
-  const server = new WebSocketServer({ port: 0, host: '0.0.0.0' })
-  const myPort = server.address().port
+  const server = new WebSocketServer({ noServer: true })
+  const httpServer = createServer()
+  await new Promise(res => httpServer.listen(0, '0.0.0.0', res))
+  const myPort = httpServer.address().port
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url === '/' + room) {
+      server.handleUpgrade(req, socket, head, ws => server.emit('connection', ws, req))
+    } else {
+      socket.destroy()
+    }
+  })
   server.on('connection', ws => addConnection(ws))
 
   myEndpoints.add(`ws://localhost:${myPort}/${room}`)
