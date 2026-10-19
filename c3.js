@@ -5,8 +5,10 @@
 //   node c3.js connect
 // Node 22+.
 
-// Suppress localStorage noise from ws/yjs before imports fire
-process.env.NODE_NO_WARNINGS = '1'
+process.on('warning', w => {
+  if (w.name === 'ExperimentalWarning' && w.message.includes('localStorage')) return
+  console.warn(w)
+})
 
 import * as Y from 'yjs'
 import chokidar from 'chokidar'
@@ -72,6 +74,7 @@ function warnOnce(key, ...a) { if (!onceWarned.has(key)) { onceWarned.add(key); 
 
 const git = (...a) => execFileSync('git', a, { cwd: workDir, encoding: 'utf8', maxBuffer: 1 << 26 }).trim()
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
+const isGitIgnored = rel => { try { git('check-ignore', '-q', rel); return true } catch { return false } }
 
 const readId = () => { try { return fs.readFileSync(ID_FILE, 'utf8').trim() } catch { return null } }
 const ensureId = () => { mkdirp(SESSION_DIR); if (!readId()) atomicWrite(ID_FILE, crypto.randomUUID()); return readId() }
@@ -266,6 +269,8 @@ function removeFromDoc(rel) {
   }, 'disk')
 }
 
+const lastWritten = new Map()
+
 function writeToDisk(rawRel) {
   const entry = files.get(rawRel)
   if (!entry) return
@@ -279,6 +284,7 @@ function writeToDisk(rawRel) {
     if (fs.existsSync(abs) && Buffer.compare(fs.readFileSync(abs), data) === 0) return
     mkdirp(path.dirname(abs))
     atomicWrite(abs, data)
+    lastWritten.set(rel, Date.now())
   } catch (err) { warnOnce('write-' + rel, 'write failed:', rel, err.message) }
 }
 
@@ -326,6 +332,7 @@ class Mesh {
     this.port = 0
     this.encKey = crypto.createHash('sha256').update(key + '\0c3-v1').digest()
     this.me = null
+    this.meId = null
     this.publicRelayUrl = null
     this.upnpClient = null
   }
@@ -358,6 +365,7 @@ class Mesh {
         sock.destroy()
       }
     })
+    this.server.on('connection', ws => this.add(ws))
     this.myEndpoints.add(`ws://localhost:${this.port}/${this.room}`)
     const ips = Object.values(os.networkInterfaces()).flat().filter(i => i?.family === 'IPv4' && !i.internal).map(i => i.address)
     ips.forEach(ip => this.myEndpoints.add(`ws://${ip}:${this.port}/${this.room}`))
@@ -372,6 +380,8 @@ class Mesh {
   }
 
   add(ws, isRelay = false, relayUrl = null) {
+    if (ws._c3Added) return
+    ws._c3Added = true
     this.connections.add(ws)
     ws.on('message', data => {
       const plain = this.decrypt(data.toString())
@@ -380,7 +390,7 @@ class Mesh {
       if (m.t === 'u' || m.t === 's') {
         try { Y.applyUpdate(this.doc, new Uint8Array(Buffer.from(m.d, 'base64')), 'remote') } catch {}
       } else if (m.t === 'h') {
-        this.awareness.set(m.email || m.name, { name: m.name, email: m.email, ts: Date.now() })
+        this.awareness.set(m.id, { name: m.name, email: m.email, ts: Date.now() })
       } else if (m.t === 'ra' && Array.isArray(m.urls)) {
         for (const u of m.urls) {
           if (this.relayUrls.has(u)) continue
@@ -396,7 +406,7 @@ class Mesh {
     ws.on('error', () => {})
     try {
       ws.send(this.encrypt({ t: 's', d: Buffer.from(Y.encodeStateAsUpdate(this.doc)).toString('base64') }))
-      ws.send(this.encrypt({ t: 'h', name: this.me.name, email: this.me.email }))
+      ws.send(this.encrypt({ t: 'h', id: this.meId, name: this.me.name, email: this.me.email }))
       if (this.publicRelayUrl) ws.send(this.encrypt({ t: 'ra', urls: [this.publicRelayUrl] }))
     } catch {}
   }
@@ -413,17 +423,20 @@ class Mesh {
   }
 
   connectPeer(url) {
-    if (this.myEndpoints.has(url)) return
+    if (this.myEndpoints.has(url)) {
+      ui.warn('Cannot connect to self:', url)
+      return
+    }
+    ui.say(`Connecting to peer: ${url}`)
     const ws = new WebSocket(url)
     ws.on('open', () => this.add(ws))
-    ws.on('error', () => {})
+    ws.on('error', err => ui.warn('Peer connection failed:', url, err.message || ''))
     ws.on('close', () => {})
   }
 
   othersAlive() {
-    const meId = this.me.email || this.me.name
     let n = 0
-    for (const [k] of this.awareness) if (k !== meId) n++
+    for (const [k] of this.awareness) if (k !== this.meId) n++
     return n
   }
 
@@ -460,27 +473,28 @@ async function connect() {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'unknown'),
     email: gitOk('config', 'user.email') ?? `${os.userInfo().username}@${os.hostname()}`,
   }
+  const meId = crypto.randomBytes(4).toString('hex')
 
   const mesh = new Mesh(room, key, doc)
   mesh.me = me
+  mesh.meId = meId
   const myIps = await mesh.start()
 
-  // Print direct-connect URLs so users can bypass broken UDP
   console.log('')
-  console.log('Share one of these URLs with peers on the same network:')
-  for (const ip of myIps) {
-    console.log(`  --peer ws://${ip}:${mesh.port}/${room}`)
+  const directPeers = flags('peer')
+  if (directPeers.length === 0) {
+    console.log('Share one of these URLs with peers on the same network:')
+    for (const ip of myIps) {
+      console.log(`  --peer ws://${ip}:${mesh.port}/${room}`)
+    }
+    if (myIps.length === 0) console.log('  (no local IP found -- rely on relays)')
   }
-  if (myIps.length === 0) console.log('  (no local IP found -- rely on relays)')
   console.log('')
 
-  // Direct --peer connections (bypass all discovery)
   for (const peerUrl of flags('peer')) {
-    ui.say(`Connecting to peer: ${peerUrl}`)
     mesh.connectPeer(peerUrl)
   }
 
-  // Configured relay URLs
   for (const u of [...(config.signaling || []), ...(process.env.C3_SIGNALING ? process.env.C3_SIGNALING.split(',') : [])]) {
     const trimmed = u.trim()
     if (trimmed) mesh.relayUrls.add(trimmed)
@@ -491,7 +505,6 @@ async function connect() {
     for (const url of mesh.relayUrls) if (!mesh.activeRelays.has(url)) mesh.connectRelay(url)
   }, 10000)
 
-  // Local UDP broadcast + multicast discovery
   let lanSock
   const wantLan = !flags('peer').length && !flags('signal').length && !config.signaling && !process.env.C3_SIGNALING
   if (wantLan && !process.env.C3_NO_LAN) {
@@ -536,10 +549,10 @@ async function connect() {
   })
 
   const hb = setInterval(() => {
-    mesh.broadcast({ t: 'h', name: me.name, email: me.email })
+    mesh.broadcast({ t: 'h', id: meId, name: me.name, email: me.email })
     const now = Date.now()
-    for (const [k, v] of mesh.awareness) if (now - v.ts > 15000) mesh.awareness.delete(k)
-  }, 5000)
+    for (const [k, v] of mesh.awareness) if (now - v.ts > 5000) mesh.awareness.delete(k)  // was 15000
+  }, 1500)  // was 5000
 
   backend.prepare()
 
@@ -589,7 +602,12 @@ async function connect() {
   }
   chokidar.watch(workDir, { ignoreInitial: true, ignored: watcherIgnored, awaitWriteFinish: { stabilityThreshold: 150 } })
     .on('add', p => syncFromDisk(relOf(p)))
-    .on('change', p => syncFromDisk(relOf(p)))
+    .on('change', p => {
+      const r = relOf(p)
+      const recent = lastWritten.get(r)
+      if (recent && Date.now() - recent < 500) return
+      syncFromDisk(r)
+    })
     .on('unlink', p => { const r = relOf(p); if (backend.isShareable(r)) removeFromDoc(r) })
 
   const sessionMessage = () => {
