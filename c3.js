@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// CIII (c3) — P2P live session (git | folder | none).
+// CIII (c3) -- P2P live session (git | folder | none).
 // Clone this folder into your project, add "c3/" to .gitignore, then:
 //   npm install
 //   node c3.js config
@@ -52,16 +52,16 @@ const atomicWrite = (abs, data) => {
   fs.renameSync(abs + '.tmp-' + process.pid, abs)
 }
 
-// ---------- UI helpers ----------
+// ---------- UI helpers (ASCII only) ----------
 const C = { r:'\x1b[0m', d:'\x1b[2m', red:'\x1b[31m', grn:'\x1b[32m', yel:'\x1b[33m', cyn:'\x1b[36m' }
 const verbose = () => !!process.env.C3_VERBOSE
 const log = (...a) => { if (verbose()) console.log(`${C.d}[${new Date().toLocaleTimeString()}]${C.r}`, ...a) }
 
 const ui = {
-  set(msg) { if (!verbose() && process.stdout.isTTY) process.stdout.write(`\r\x1b[K${C.cyn}● c3${C.r} ${msg}`) },
+  set(msg) { if (!verbose() && process.stdout.isTTY) process.stdout.write(`\r\x1b[K${C.cyn}* c3${C.r} ${msg}`) },
   clear() { if (!verbose() && process.stdout.isTTY) process.stdout.write('\r\x1b[K') },
-  say(...a) { this.clear(); console.log(`${C.cyn}● c3${C.r}`, ...a) },
-  warn(...a) { this.clear(); console.error(`${C.yel}● warning${C.r}`, ...a) }
+  say(...a) { this.clear(); console.log(`${C.cyn}* c3${C.r}`, ...a) },
+  warn(...a) { this.clear(); console.error(`${C.yel}! warning${C.r}`, ...a) }
 }
 
 const onceWarned = new Set()
@@ -151,7 +151,7 @@ function makeBackend(config) {
       identity() {
         const u = gitOk('remote', 'get-url', 'origin')
         if (u) return canonUrl(u)
-        return readId() ?? die('No origin remote and no .c3/id — pass --name or run c3 config.')
+        return readId() ?? die('No origin remote and no .c3/id -- pass --name or run c3 config.')
       },
       prepare() {
         gitOk('fetch')
@@ -187,7 +187,7 @@ function makeBackend(config) {
     const relArchive = insideWork ? path.relative(workDir, archive).split(path.sep).join('/') : null
     return {
       kind: 'folder',
-      identity: () => readId() ?? die('folder backend needs .c3/id — run c3 config or pass --name'),
+      identity: () => readId() ?? die('folder backend needs .c3/id -- run c3 config or pass --name'),
       prepare() {
         mkdirp(path.join(archive, 'snapshots'))
         if (archive === workDir) die('archive path cannot be the working dir itself; use backend "none" for that')
@@ -229,7 +229,7 @@ function makeBackend(config) {
   if (config.backend === 'none') {
     return {
       kind: 'none',
-      identity: () => readId() ?? die('backend "none" has no identity channel — pass --name or run c3 config'),
+      identity: () => readId() ?? die('backend "none" has no identity channel -- pass --name or run c3 config'),
       prepare() {},
       listShareable() { return walkTree(rules) },
       isShareable: rules,
@@ -365,7 +365,7 @@ async function connect() {
     die('No session key. Get it from the host:\n' +
       `  c3 connect --key <key>${name ? ` --name "${name}"` : ''}`)
   }
-  if (key.length < 20) ui.warn('key looks low-entropy — prefer a generated one.')
+  if (key.length < 20) ui.warn('key looks low-entropy -- prefer a generated one.')
   if (flag('key')) { atomicWrite(keyFile, key); fs.chmodSync(keyFile, 0o600) }
 
   const room = 'c3-' + crypto.createHash('sha256')
@@ -517,7 +517,7 @@ async function connect() {
   if (fs.existsSync(stateFile)) {
     const genThen = fs.existsSync(genFile) ? fs.readFileSync(genFile, 'utf8').trim() : null
     if (genThen && genThen !== backend.generation()) {
-      ui.say('Saved session state predates latest archive — discarding.')
+      ui.say('Saved session state predates latest archive -- discarding.')
       fs.rmSync(stateFile, { force: true })
     } else {
       Y.applyUpdate(doc, fs.readFileSync(stateFile), 'restore')
@@ -564,7 +564,7 @@ async function connect() {
     }
     advertise()
     const iv = setInterval(advertise, 2000)
-    ui.set('looking for peers (LAN + internet)…')
+    ui.set('looking for peers (LAN + internet)...')
     await sleep(LAN_DISCOVER_MS)
     clearInterval(iv)
   }
@@ -576,10 +576,10 @@ async function connect() {
       for (const rel of seed) { try { bytes += fs.statSync(path.join(workDir, rel)).size } catch {} }
       if (!config.forceSeed && (seed.length > SEED_FILES || bytes > SEED_BYTES))
         die(`Refusing to seed ${seed.length} files / ${(bytes / 1e6).toFixed(0)} MB. Trim c3/.c3/ignore, or set "forceSeed": true in config.`)
-      ui.say(`No peers — hosting from this directory (${seed.length} files).`)
+      ui.say(`No peers -- hosting from this directory (${seed.length} files).`)
       for (const rel of seed) syncFromDisk(rel, true)
     } else {
-      ui.say(othersAlive() ? `Joined session with ${othersAlive()} peer(s).` : 'No peers — resuming local state.')
+      ui.say(othersAlive() ? `Joined session with ${othersAlive()} peer(s).` : 'No peers -- resuming local state.')
       reconcile()
     }
   }
@@ -630,9 +630,9 @@ async function connect() {
       if (othersAlive() > 0) {
         atomicWrite(stateFile, Y.encodeStateAsUpdate(doc))
         atomicWrite(genFile, backend.generation())
-        ui.say(`Others still in session (${othersAlive()}) — keeping local state, not saving.`)
+        ui.say(`Others still in session (${othersAlive()}) -- keeping local state, not saving.`)
       } else if (touched.size === 0) {
-        ui.say('Nothing changed — nothing to save.')
+        ui.say('Nothing changed -- nothing to save.')
         fs.rmSync(stateFile, { force: true })
       } else if (!(await confirmSave())) {
         atomicWrite(stateFile, Y.encodeStateAsUpdate(doc))
@@ -641,7 +641,7 @@ async function connect() {
       } else {
         const verifyFailed = !verifyOk()
         if (verifyFailed && backend.kind === 'git') {
-          ui.warn('Verify failed — committing locally, NOT pushing.')
+          ui.warn('Verify failed -- committing locally, NOT pushing.')
           backend.save(touched, { user: me.name, message: sessionMessage() }, { publish: false })
           atomicWrite(stateFile, Y.encodeStateAsUpdate(doc))
           atomicWrite(genFile, backend.generation())
@@ -649,9 +649,9 @@ async function connect() {
           const r = backend.save(touched, { user: me.name, message: sessionMessage(), verifyFailed })
           if (r.blocked) ui.warn(r.blocked)
           else if (!r.saved && r.exported === false && backend.kind === 'none')
-            ui.say('No archive — run `c3 export <dir>` to keep a copy.')
+            ui.say('No archive -- run `c3 export <dir>` to keep a copy.')
           else if (r.pushed === false) {
-            ui.warn('Could not publish — commit kept locally.')
+            ui.warn('Could not publish -- commit kept locally.')
             atomicWrite(stateFile, Y.encodeStateAsUpdate(doc))
             atomicWrite(genFile, backend.generation())
           } else {
@@ -662,7 +662,7 @@ async function connect() {
       }
     } catch (err) {
       try { atomicWrite(stateFile, Y.encodeStateAsUpdate(doc)); atomicWrite(genFile, backend.generation()) } catch {}
-      console.error('Save failed — state kept locally:', err.message)
+      console.error('Save failed -- state kept locally:', err.message)
     } finally {
       if (lanSock) try { lanSock.close() } catch {}
       server.clients.forEach(c => c.close())
@@ -677,7 +677,7 @@ async function connect() {
 
   const tick = setInterval(() => {
     const n = othersAlive()
-    ui.set(`live · ${n} peer${n === 1 ? '' : 's'} · ${files.size} files · ${backend.kind}`)
+    ui.set(`live - ${n} peer${n === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}`)
   }, 2000)
 
   ui.say('Ready. Ctrl+C to leave.')
@@ -694,7 +694,7 @@ async function configCmd() {
     const a = (await rl.question(`${C.cyn}?${C.r} ${q}${def ? ` [${C.yel}${def}${C.r}] ` : ': '}`)).trim()
     return a || def
   }
-  ui.say(`${C.cyn}c3 config${C.r} — ${workDir}`)
+  ui.say(`${C.cyn}c3 config${C.r} -- ${workDir}`)
 
   let raw = flag('archive')
   let kind, archivePath
@@ -702,12 +702,16 @@ async function configCmd() {
   else if (['git','folder','none'].includes(raw)) { kind = raw }
 
   if (!kind) {
-    const choice = await ask(`Archive backend?\n  1) git    – this project IS a git repo (snapshots become commits)\n  2) folder – external path / NAS / server (dated snapshots)\n  3) none   – no auto-archive (use export)\nPick 1/2/3`, isGit ? '1' : '2')
+    const choice = await ask(`Archive backend?
+  1) git    - this project IS a git repo (snapshots become commits)
+  2) folder - external path / NAS / server (dated snapshots)
+  3) none   - no auto-archive (use export)
+Pick 1/2/3`, isGit ? '1' : '2')
     kind = { '1': 'git', '2': 'folder', '3': 'none' }[choice] || choice
   }
   if (!['git','folder','none'].includes(kind)) die('Backend must be git, folder:<path>, or none.')
 
-  if (kind === 'git' && !isGit) die('No .git here — git backend needs a repo.')
+  if (kind === 'git' && !isGit) die('No .git here -- git backend needs a repo.')
   if (kind === 'folder') {
     archivePath ??= await ask('Archive folder path (absolute or relative, e.g. /mnt/nas/c3-archive)', 'archive')
     archivePath = path.resolve(workDir, archivePath)
@@ -728,7 +732,7 @@ async function configCmd() {
     else if (c === 'paste') key = (await rl.question('Paste key: ')).trim()
     else key = crypto.randomBytes(16).toString('base64url')
   }
-  if (key.length < 20) ui.warn('low-entropy key — prefer a generated one.')
+  if (key.length < 20) ui.warn('low-entropy key -- prefer a generated one.')
   atomicWrite(keyFile, key); fs.chmodSync(keyFile, 0o600)
 
   const verify = (await ask('Verify command before publishing (blank = none, e.g. "npm test")', '')).trim()
@@ -774,7 +778,7 @@ async function doctor() {
   let config = null
   if (fs.existsSync(CONFIG_FILE)) { try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch {} }
   const lines = []
-  const ok = (n, c, hint) => lines.push(`${c ? `${C.grn}✔${C.r}` : `${C.red}✘${C.r}`} ${n}${c ? '' : ` — ${hint}`}`)
+  const ok = (n, c, hint) => lines.push(`${c ? `${C.grn}+${C.r}` : `${C.red}-${C.r}`} ${n}${c ? '' : ` -- ${hint}`}`)
   ok('Node 22+', Number(process.version.slice(1).split('.')[0]) >= 22, 'upgrade Node')
   ok('project config', fs.existsSync(CONFIG_FILE), 'run `c3 config`')
   let isIgnored = false
@@ -794,7 +798,7 @@ async function doctor() {
     } catch (e) { ok('identity resolved', false, e.message) }
   }
   ui.say(lines.join('\n'))
-  ui.say(lines.some(l => l.includes('✘')) ? 'Some checks failed.' : 'All good.')
+  ui.say(lines.some(l => l.includes('- ')) ? 'Some checks failed.' : 'All good.')
 }
 
 // ---------- dispatch ----------
