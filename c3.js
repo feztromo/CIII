@@ -531,7 +531,8 @@ async function configCmd() {
     const a = (await rl.question(`${C.cyn}?${C.r} ${q}${def ? ` [${C.yel}${def}${C.r}] ` : ': '}`)).trim()
     return a || def
   }
-  ui.say(`${C.cyn}c3 config${C.r} -- ${workDir}`)
+  ui.clear()
+  console.log(`c3 config -- ${workDir}`)
 
   let raw = flag('archive')
   let kind, archivePath
@@ -539,11 +540,11 @@ async function configCmd() {
   else if (['git','folder','none'].includes(raw)) { kind = raw }
 
   if (!kind) {
-    const choice = await ask(`Archive backend?
+    const choice = await ask(`Backend archive
   1) git    - this project IS a git repo (snapshots become commits)
   2) folder - external path / NAS / server (dated snapshots)
   3) none   - no auto-archive (use export)
-Pick 1/2/3`, isGit ? '1' : '2')
+  Pick 1/2/3`, isGit ? '1' : '2')
     kind = { '1': 'git', '2': 'folder', '3': 'none' }[choice] || choice
   }
   if (!['git','folder','none'].includes(kind)) die('Backend must be git, folder:<path>, or none.')
@@ -572,12 +573,8 @@ Pick 1/2/3`, isGit ? '1' : '2')
   if (key.length < 20) ui.warn('low-entropy key -- prefer a generated one.')
   atomicWrite(keyFile, key); fs.chmodSync(keyFile, 0o600)
 
-  const verify = (await ask('Verify command before publishing (blank = none, e.g. "npm test")', '')).trim()
-  const sig = (await ask('Extra signaling servers (blank = defaults; rarely needed)', '')).trim()
   const config = { backend: kind, name }
   if (archivePath) config.archive = archivePath
-  if (verify) config.verify = verify
-  if (sig) config.signaling = sig.split(',').map(s => s.trim()).filter(Boolean)
   atomicWrite(CONFIG_FILE, JSON.stringify(config, null, 2))
 
   if (kind === 'git') {
@@ -589,11 +586,12 @@ Pick 1/2/3`, isGit ? '1' : '2')
   }
   rl.close()
 
-  ui.say(`\nConfig written: ${CONFIG_FILE}`)
-  ui.say('Key and state are inside the c3 folder (not pushed).')
-  ui.say('\nInvite anyone, anywhere (share out-of-band):')
+  ui.clear()
+  console.log(`Config written: ${CONFIG_FILE}`)
+  console.log('Key and state stay inside the c3 folder (not pushed).')
+  console.log('')
+  console.log('Invite teammates (share in chat):')
   console.log(`  node c3.js connect --name "${name}" --key ${key}`)
-  ui.say('On the same Wi-Fi everyone can just run:  node c3.js connect')
 }
 
 // ---------- export ----------
@@ -672,6 +670,10 @@ How it works:
   directly peer-to-peer over WebRTC (encrypted, NAT-traversing).
   No host, no ports, no IP addresses. Same session name + key
   on any machine = same room.
+
+Advanced options (edit .c3/config.json directly):
+  "verify": "npm test"                          run before publishing
+  "signaling": ["wss://my-relay.example.com"]   extra signaling servers
 `
 
 if (cmd === 'config') await configCmd()
