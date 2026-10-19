@@ -5,6 +5,9 @@
 //   node c3.js connect
 // Node 22+.
 
+// Suppress localStorage noise from ws/yjs before imports fire
+process.env.NODE_NO_WARNINGS = '1'
+
 import * as Y from 'yjs'
 import chokidar from 'chokidar'
 import ignore from 'ignore'
@@ -22,31 +25,32 @@ import { WebSocketServer, WebSocket } from 'ws'
 const argv = process.argv.slice(2)
 const cmd = argv[0]
 const flag = n => { const i = argv.indexOf('--' + n); return (i >= 0 && argv[i + 1]) ? argv[i + 1] : undefined }
+const flags = n => {
+  const out = []
+  for (let i = 0; i < argv.length - 1; i++) if (argv[i] === '--' + n && argv[i + 1]) out.push(argv[i + 1])
+  return out
+}
 const has = n => argv.includes('--' + n)
 
-// ---------- platform detection ----------
 const IS_WIN = process.platform === 'win32'
-const IS_MAC = process.platform === 'darwin'
-const IS_LINUX = process.platform === 'linux'
 
-// ---------- paths ----------
 const c3Dir = path.dirname(fileURLToPath(import.meta.url))
 const SESSION_DIR = path.join(c3Dir, '.c3')
 const CONFIG_FILE = path.join(SESSION_DIR, 'config.json')
 const ID_FILE = path.join(SESSION_DIR, 'id')
 const STATE_ROOT = SESSION_DIR
 
-const workDir = process.cwd()
+const workDir = path.resolve(c3Dir, '..')
 const c3Rel = path.relative(workDir, c3Dir).split(path.sep).join('/')
 const c3InsideWork = !c3Rel.startsWith('..') && !path.isAbsolute(c3Rel)
 const c3Name = path.basename(c3Dir)
 
-const SIGNALING = (process.env.C3_SIGNALING_DEFAULT ?? '').split(',').filter(Boolean)
 const MAX_FILE = 16 << 20
 const SEED_FILES = 10_000
 const SEED_BYTES = 200 << 20
 const LAN_DISCOVER_PORT = 42424
-const LAN_DISCOVER_MS = 2500
+const LAN_MCAST = '239.255.42.42'
+const LAN_DISCOVER_MS = 3000
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const die = m => { console.error(m); process.exit(1) }
@@ -56,33 +60,24 @@ const atomicWrite = (abs, data) => {
   fs.renameSync(abs + '.tmp-' + process.pid, abs)
 }
 
-// ---------- UI ----------
 const C = IS_WIN ? { r:'', d:'', red:'', grn:'', yel:'', cyn:'' } : { r:'\x1b[0m', d:'\x1b[2m', red:'\x1b[31m', grn:'\x1b[32m', yel:'\x1b[33m', cyn:'\x1b[36m' }
-const verbose = () => !!process.env.C3_VERBOSE
-const log = (...a) => { if (verbose()) console.log(`${C.d}[${new Date().toLocaleTimeString()}]${C.r}`, ...a) }
-
 const ui = {
-  set(msg) { if (!verbose() && process.stdout.isTTY) process.stdout.write(`\r\x1b[K* c3${C.r} ${msg}`) },
-  clear() { if (!verbose() && process.stdout.isTTY) process.stdout.write('\r\x1b[K') },
+  set(msg) { if (process.stdout.isTTY) process.stdout.write(`\r\x1b[K* c3${C.r} ${msg}`) },
+  clear() { if (process.stdout.isTTY) process.stdout.write('\r\x1b[K') },
   say(...a) { this.clear(); console.log(`* c3${C.r}`, ...a) },
   warn(...a) { this.clear(); console.error(`! warning${C.r}`, ...a) }
 }
-
 const onceWarned = new Set()
 function warnOnce(key, ...a) { if (!onceWarned.has(key)) { onceWarned.add(key); ui.warn(...a) } }
 
-// ---------- git ----------
 const git = (...a) => execFileSync('git', a, { cwd: workDir, encoding: 'utf8', maxBuffer: 1 << 26 }).trim()
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
-const isGitIgnored = rel => { try { git('check-ignore', '-q', rel); return true } catch { return false } }
 
-// ---------- identity ----------
 const readId = () => { try { return fs.readFileSync(ID_FILE, 'utf8').trim() } catch { return null } }
 const ensureId = () => { mkdirp(SESSION_DIR); if (!readId()) atomicWrite(ID_FILE, crypto.randomUUID()); return readId() }
 const stateDir = id => { const d = path.join(STATE_ROOT, crypto.createHash('sha1').update(id).digest('hex')); mkdirp(d); return d }
 const canonUrl = u => u.replace(/^[a-z+]+:\/\//, '').replace(/^[^@]+@/, '').replace(/\.git$/, '').replace(/^([^/]+):/, '$1/')
 
-// ---------- path safety ----------
 function safeRel(rel) {
   if (typeof rel !== 'string' || rel === '') return null
   const abs = path.resolve(workDir, rel)
@@ -103,7 +98,6 @@ function symlinkEscape(abs) {
   return false
 }
 
-// ---------- ignore ----------
 const DEFAULT_IGNORE = ['node_modules/', 'dist/', 'build/', 'out/', '.env*', '*.pem', 'id_rsa*', '*.log', '.DS_Store', 'Thumbs.db', 'desktop.ini']
 function rulesMatcher() {
   const ig = ignore().add(DEFAULT_IGNORE)
@@ -126,29 +120,9 @@ function walkTree(isShareable) {
   return out
 }
 
-// ---------- UPnP (skip on Windows) ----------
-async function tryUpnp(port) {
-  if (IS_WIN || process.env.C3_NO_UPNP) return null
-  try {
-    const mod = await import('nat-api')
-    const NatAPI = mod.default || mod
-    const client = new NatAPI()
-    await new Promise((res, rej) => {
-      client.map({ publicPort: port, privatePort: port, ttl: 1200, protocol: 'TCP' }, err => err ? rej(err) : res())
-    })
-    const ip = await new Promise((res, rej) => {
-      client.externalIp((err, ip) => err ? rej(err) : res(ip))
-    })
-    return { client, ip }
-  } catch {
-    return null
-  }
-}
-
 // ---------- archive backends ----------
 function makeBackend(config) {
   const rules = rulesMatcher()
-
   if (config.backend === 'git') {
     return {
       kind: 'git',
@@ -166,13 +140,10 @@ function makeBackend(config) {
       isShareable(rel) { return rules(rel) && !isGitIgnored(rel) },
       generation() { return gitOk('rev-parse', 'HEAD') ?? 'no-head' },
       save(touched, meta, { publish = true } = {}) {
-        const paths = [...touched].filter(r =>
-          fs.existsSync(path.join(workDir, r)) || files.has(r) || !!gitOk('ls-files', '--', r))
-        for (let i = 0; i < paths.length; i += 500)
-          git('add', '-A', '--', ...paths.slice(i, i + 500))
+        const paths = [...touched].filter(r => fs.existsSync(path.join(workDir, r)) || files.has(r) || !!gitOk('ls-files', '--', r))
+        for (let i = 0; i < paths.length; i += 500) git('add', '-A', '--', ...paths.slice(i, i + 500))
         if (!git('status', '--porcelain')) return { saved: false }
-        const idc = gitOk('config', 'user.name') ? []
-          : ['-c', 'user.name=c3', '-c', 'user.email=c3@localhost']
+        const idc = gitOk('config', 'user.name') ? [] : ['-c', 'user.name=c3', '-c', 'user.email=c3@localhost']
         git(...idc, 'commit', '-m', meta.message)
         if (!publish) return { saved: true, pushed: false }
         try { git('push'); return { saved: true, pushed: true } }
@@ -183,7 +154,6 @@ function makeBackend(config) {
       },
     }
   }
-
   if (config.backend === 'folder') {
     const archive = path.resolve(workDir, config.archive)
     const lock = path.join(archive, '.c3-lock')
@@ -207,8 +177,7 @@ function makeBackend(config) {
         if (fs.existsSync(lock)) {
           try {
             const l = JSON.parse(fs.readFileSync(lock, 'utf8'))
-            const fresh = Date.now() - l.ts < 2 * 3600_000
-            if (fresh && !(l.host === os.hostname() && l.pid === process.pid))
+            if (Date.now() - l.ts < 2 * 3600_000 && !(l.host === os.hostname() && l.pid === process.pid))
               return { saved: false, blocked: `archive locked by ${l.host}` }
           } catch {}
         }
@@ -222,14 +191,12 @@ function makeBackend(config) {
             fs.copyFileSync(path.join(workDir, rel), path.join(snap, rel))
           }
           atomicWrite(path.join(archive, 'gen'), String(Number(this.generation()) + 1))
-          fs.appendFileSync(path.join(archive, '.c3-session-log'),
-            `${ts}  ${meta.user}  ${list.length} files  ${touched.size} changed${meta.verifyFailed ? '  VERIFY FAILED' : ''}\n`)
+          fs.appendFileSync(path.join(archive, '.c3-session-log'), `${ts}  ${meta.user}  ${list.length}f  ${touched.size}c${meta.verifyFailed ? ' FAIL' : ''}\n`)
           return { saved: true, pushed: true, snapshot: snap }
         } finally { fs.rmSync(lock, { force: true }) }
       },
     }
   }
-
   if (config.backend === 'none') {
     return {
       kind: 'none',
@@ -241,11 +208,10 @@ function makeBackend(config) {
       save() { return { saved: false, exported: false } },
     }
   }
-
   die('Unknown backend: ' + config.backend)
 }
 
-// ---------- Yjs ----------
+// ---------- Yjs state ----------
 const doc = new Y.Doc()
 const files = doc.getMap('files')
 const texts = doc.getMap('texts')
@@ -307,9 +273,7 @@ function writeToDisk(rawRel) {
   if (!rel || rel !== rawRel) { warnOnce('unsafe-' + rawRel, 'blocked unsafe path from peer:', rawRel); return }
   const abs = path.join(workDir, rel)
   if (symlinkEscape(abs)) { warnOnce('symlink', 'blocked symlink escape:', rel); return }
-  const data = entry.bin
-    ? Buffer.from(blobs.get(entry.id) ?? '', 'base64')
-    : Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
+  const data = entry.bin ? Buffer.from(blobs.get(entry.id) ?? '', 'base64') : Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
   if (data.length > MAX_FILE) { warnOnce('big-' + rel, 'blocked oversized file from peer:', rel); return }
   try {
     if (fs.existsSync(abs) && Buffer.compare(fs.readFileSync(abs), data) === 0) return
@@ -347,6 +311,128 @@ function reconcile() {
     if (!files.has(rel)) fs.rmSync(path.join(workDir, rel), { force: true })
 }
 
+// ---------- network ----------
+class Mesh {
+  constructor(room, key, doc) {
+    this.room = room
+    this.doc = doc
+    this.connections = new Set()
+    this.awareness = new Map()
+    this.relayUrls = new Set()
+    this.activeRelays = new Map()
+    this.myEndpoints = new Set()
+    this.server = null
+    this.http = null
+    this.port = 0
+    this.encKey = crypto.createHash('sha256').update(key + '\0c3-v1').digest()
+    this.me = null
+    this.publicRelayUrl = null
+    this.upnpClient = null
+  }
+
+  encrypt(obj) {
+    const iv = crypto.randomBytes(12)
+    const cipher = crypto.createCipheriv('aes-256-gcm', this.encKey, iv)
+    const ct = Buffer.concat([cipher.update(JSON.stringify(obj), 'utf8'), cipher.final()])
+    return JSON.stringify({ iv: iv.toString('base64'), ct: ct.toString('base64'), tag: cipher.getAuthTag().toString('base64') })
+  }
+  decrypt(str) {
+    let m; try { m = JSON.parse(str) } catch { return null }
+    if (!m.iv || !m.ct || !m.tag) return null
+    try {
+      const d = crypto.createDecipheriv('aes-256-gcm', this.encKey, Buffer.from(m.iv, 'base64'))
+      d.setAuthTag(Buffer.from(m.tag, 'base64'))
+      return Buffer.concat([d.update(Buffer.from(m.ct, 'base64')), d.final()]).toString('utf8')
+    } catch { return null }
+  }
+
+  async start() {
+    this.http = createServer()
+    this.server = new WebSocketServer({ noServer: true })
+    await new Promise(res => this.http.listen(0, '0.0.0.0', res))
+    this.port = this.http.address().port
+    this.http.on('upgrade', (req, sock, head) => {
+      if (req.url === '/' + this.room) {
+        this.server.handleUpgrade(req, sock, head, ws => this.server.emit('connection', ws, req))
+      } else {
+        sock.destroy()
+      }
+    })
+    this.myEndpoints.add(`ws://localhost:${this.port}/${this.room}`)
+    const ips = Object.values(os.networkInterfaces()).flat().filter(i => i?.family === 'IPv4' && !i.internal).map(i => i.address)
+    ips.forEach(ip => this.myEndpoints.add(`ws://${ip}:${this.port}/${this.room}`))
+    return ips
+  }
+
+  broadcast(obj) {
+    if (this.connections.size === 0) return
+    let payload
+    try { payload = this.encrypt(obj) } catch { return }
+    for (const ws of this.connections) if (ws.readyState === WebSocket.OPEN) ws.send(payload)
+  }
+
+  add(ws, isRelay = false, relayUrl = null) {
+    this.connections.add(ws)
+    ws.on('message', data => {
+      const plain = this.decrypt(data.toString())
+      if (!plain) return
+      let m; try { m = JSON.parse(plain) } catch { return }
+      if (m.t === 'u' || m.t === 's') {
+        try { Y.applyUpdate(this.doc, new Uint8Array(Buffer.from(m.d, 'base64')), 'remote') } catch {}
+      } else if (m.t === 'h') {
+        this.awareness.set(m.email || m.name, { name: m.name, email: m.email, ts: Date.now() })
+      } else if (m.t === 'ra' && Array.isArray(m.urls)) {
+        for (const u of m.urls) {
+          if (this.relayUrls.has(u)) continue
+          this.relayUrls.add(u)
+          this.connectRelay(u)
+        }
+      }
+    })
+    ws.on('close', () => {
+      this.connections.delete(ws)
+      if (isRelay && relayUrl) this.activeRelays.delete(relayUrl)
+    })
+    ws.on('error', () => {})
+    try {
+      ws.send(this.encrypt({ t: 's', d: Buffer.from(Y.encodeStateAsUpdate(this.doc)).toString('base64') }))
+      ws.send(this.encrypt({ t: 'h', name: this.me.name, email: this.me.email }))
+      if (this.publicRelayUrl) ws.send(this.encrypt({ t: 'ra', urls: [this.publicRelayUrl] }))
+    } catch {}
+  }
+
+  connectRelay(baseUrl) {
+    if (this.activeRelays.has(baseUrl)) return
+    const url = baseUrl.replace(/\/$/, '') + '/' + this.room
+    if (this.myEndpoints.has(url)) return
+    const ws = new WebSocket(url)
+    this.activeRelays.set(baseUrl, ws)
+    ws.on('open', () => this.add(ws, true, baseUrl))
+    ws.on('close', () => this.activeRelays.delete(baseUrl))
+    ws.on('error', () => this.activeRelays.delete(baseUrl))
+  }
+
+  connectPeer(url) {
+    if (this.myEndpoints.has(url)) return
+    const ws = new WebSocket(url)
+    ws.on('open', () => this.add(ws))
+    ws.on('error', () => {})
+    ws.on('close', () => {})
+  }
+
+  othersAlive() {
+    const meId = this.me.email || this.me.name
+    let n = 0
+    for (const [k] of this.awareness) if (k !== meId) n++
+    return n
+  }
+
+  destroy() {
+    if (this.server) this.server.clients.forEach(c => c.close())
+    if (this.http) this.http.close()
+  }
+}
+
 // ---------- connect ----------
 async function connect() {
   let config
@@ -363,154 +449,96 @@ async function connect() {
   const identity = name ?? backend.identity()
   const sdir = stateDir(identity)
   const keyFile = path.join(sdir, 'key')
-  let key = flag('key') ?? process.env.C3_KEY
-    ?? (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : null)
-  if (!key) {
-    die('No session key. Get it from the host:\n' +
-      `  c3 connect --key <key>${name ? ` --name "${name}"` : ''}`)
-  }
+  let key = flag('key') ?? process.env.C3_KEY ?? (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : null)
+  if (!key) die('No session key. Get it from the host:\n  c3 connect --key <key>' + (name ? ` --name "${name}"` : ''))
   if (key.length < 20) ui.warn('key looks low-entropy -- prefer a generated one.')
   if (flag('key')) { atomicWrite(keyFile, key); fs.chmodSync(keyFile, 0o600) }
 
-  const room = 'c3-' + crypto.createHash('sha256')
-    .update(identity + '\0' + key).digest('hex').slice(0, 24)
+  const room = 'c3-' + crypto.createHash('sha256').update(identity + '\0' + key).digest('hex').slice(0, 24)
 
   const me = {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'unknown'),
     email: gitOk('config', 'user.email') ?? `${os.userInfo().username}@${os.hostname()}`,
   }
-  const meId = me.email || me.name
 
-  // ---------- encryption ----------
-  const encKey = crypto.createHash('sha256').update(key + '\0c3-v1').digest()
-  function encrypt(obj) {
-    const iv = crypto.randomBytes(12)
-    const cipher = crypto.createCipheriv('aes-256-gcm', encKey, iv)
-    const ct = Buffer.concat([cipher.update(JSON.stringify(obj), 'utf8'), cipher.final()])
-    return JSON.stringify({ iv: iv.toString('base64'), ct: ct.toString('base64'), tag: cipher.getAuthTag().toString('base64') })
+  const mesh = new Mesh(room, key, doc)
+  mesh.me = me
+  const myIps = await mesh.start()
+
+  // Print direct-connect URLs so users can bypass broken UDP
+  console.log('')
+  console.log('Share one of these URLs with peers on the same network:')
+  for (const ip of myIps) {
+    console.log(`  --peer ws://${ip}:${mesh.port}/${room}`)
   }
-  function decrypt(str) {
-    let m; try { m = JSON.parse(str) } catch { return null }
-    if (!m.iv || !m.ct || !m.tag) return null
-    try {
-      const d = crypto.createDecipheriv('aes-256-gcm', encKey, Buffer.from(m.iv, 'base64'))
-      d.setAuthTag(Buffer.from(m.tag, 'base64'))
-      return Buffer.concat([d.update(Buffer.from(m.ct, 'base64')), d.final()]).toString('utf8')
-    } catch { return null }
-  }
+  if (myIps.length === 0) console.log('  (no local IP found -- rely on relays)')
+  console.log('')
 
-  // ---------- network ----------
-  const connections = new Set()
-  const awarenessMap = new Map()
-  const relayUrls = new Set()
-  const activeRelays = new Map()
-  const myIps = Object.values(os.networkInterfaces())
-    .flat().filter(i => i?.family === 'IPv4' && !i.internal).map(i => i.address)
-
-  const othersAlive = () => {
-    let n = 0
-    for (const [k] of awarenessMap) if (k !== meId) n++
-    return n
+  // Direct --peer connections (bypass all discovery)
+  for (const peerUrl of flags('peer')) {
+    ui.say(`Connecting to peer: ${peerUrl}`)
+    mesh.connectPeer(peerUrl)
   }
 
-  function broadcast(obj) {
-    if (connections.size === 0) return
-    let payload
-    try { payload = encrypt(obj) } catch { return }
-    for (const ws of connections) if (ws.readyState === WebSocket.OPEN) ws.send(payload)
-  }
-
-  function onMessage(data) {
-    const plain = decrypt(data.toString())
-    if (!plain) return
-    let m; try { m = JSON.parse(plain) } catch { return }
-    if (m.t === 'u' || m.t === 's') {
-      try { Y.applyUpdate(doc, new Uint8Array(Buffer.from(m.d, 'base64')), 'remote') } catch {}
-    } else if (m.t === 'h') {
-      awarenessMap.set(m.email || m.name, { name: m.name, email: m.email, ts: Date.now() })
-    } else if (m.t === 'ra' && Array.isArray(m.urls)) {
-      for (const u of m.urls) {
-        if (relayUrls.has(u)) continue
-        relayUrls.add(u)
-        connectRelay(u)
-      }
-    }
-  }
-
-  const myEndpoints = new Set()
-  let publicRelayUrl = null
-  let upnpClient = null
-
-  function addConnection(ws, isRelay = false, relayUrl = null) {
-    connections.add(ws)
-    ws.on('message', onMessage)
-    ws.on('close', () => {
-      connections.delete(ws)
-      if (isRelay && relayUrl) activeRelays.delete(relayUrl)
-    })
-    ws.on('error', () => {})
-    try {
-      ws.send(encrypt({ t: 's', d: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }))
-      ws.send(encrypt({ t: 'h', name: me.name, email: me.email }))
-      if (publicRelayUrl) ws.send(encrypt({ t: 'ra', urls: [publicRelayUrl] }))
-    } catch {}
-  }
-
-  const httpServer = createServer()
-  const server = new WebSocketServer({ noServer: true })
-  await new Promise(res => httpServer.listen(0, '0.0.0.0', res))
-  const myPort = httpServer.address().port
-  httpServer.on('upgrade', (req, sock, head) => {
-    if (req.url === '/' + room) {
-      server.handleUpgrade(req, sock, head, ws => server.emit('connection', ws, req))
-    } else {
-      sock.destroy()
-    }
-  })
-
-  myEndpoints.add(`ws://localhost:${myPort}/${room}`)
-  myIps.forEach(ip => myEndpoints.add(`ws://${ip}:${myPort}/${room}`))
-
-  function connectRelay(baseUrl) {
-    if (activeRelays.has(baseUrl)) return
-    const url = baseUrl.replace(/\/$/, '') + '/' + room
-    if (myEndpoints.has(url)) return
-    const ws = new WebSocket(url)
-    activeRelays.set(baseUrl, ws)
-    ws.on('open', () => addConnection(ws, true, baseUrl))
-    ws.on('close', () => activeRelays.delete(baseUrl))
-    ws.on('error', () => activeRelays.delete(baseUrl))
-  }
-
-  // ---------- UPnP ----------
-  const upnp = await tryUpnp(myPort)
-  if (upnp) {
-    upnpClient = upnp.client
-    publicRelayUrl = `ws://${upnp.ip}:${myPort}/${room}`
-    myEndpoints.add(publicRelayUrl)
-    ui.say(`Public relay mapped via UPnP: ${publicRelayUrl}`)
-  }
-
-  for (const u of [...(config.signaling || []), ...(process.env.C3_SIGNALING ? process.env.C3_SIGNALING.split(',') : []), ...SIGNALING]) {
+  // Configured relay URLs
+  for (const u of [...(config.signaling || []), ...(process.env.C3_SIGNALING ? process.env.C3_SIGNALING.split(',') : [])]) {
     const trimmed = u.trim()
-    if (trimmed) relayUrls.add(trimmed)
+    if (trimmed) mesh.relayUrls.add(trimmed)
   }
-  for (let i = 0; i < argv.length - 1; i++) if (argv[i] === '--signal' && argv[i + 1]) relayUrls.add(argv[i + 1])
-
-  for (const url of relayUrls) connectRelay(url)
+  for (const u of flags('signal')) mesh.relayUrls.add(u)
+  for (const url of mesh.relayUrls) mesh.connectRelay(url)
   const relayMaintainer = setInterval(() => {
-    for (const url of relayUrls) if (!activeRelays.has(url)) connectRelay(url)
+    for (const url of mesh.relayUrls) if (!mesh.activeRelays.has(url)) mesh.connectRelay(url)
   }, 10000)
+
+  // Local UDP broadcast + multicast discovery
+  let lanSock
+  const wantLan = !flags('peer').length && !flags('signal').length && !config.signaling && !process.env.C3_SIGNALING
+  if (wantLan && !process.env.C3_NO_LAN) {
+    const nodeId = crypto.randomBytes(4).toString('hex')
+    let gotPeer = false
+    try {
+      lanSock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+      lanSock.on('error', err => {
+        if (err.code === 'EACCES' || err.code === 'EPERM') warnOnce('lan-blocked', 'UDP blocked by firewall. Use --peer or --signal instead.')
+      })
+      lanSock.on('message', (msg, rinfo) => {
+        let d; try { d = JSON.parse(msg) } catch { return }
+        if (d._ !== 'c3' || d.v !== 1 || d.room !== room || d.n === nodeId) return
+        const url = `ws://${rinfo.address}:${d.port}/${room}`
+        if (mesh.myEndpoints.has(url)) return
+        gotPeer = true
+        mesh.connectPeer(url)
+      })
+      lanSock.bind(LAN_DISCOVER_PORT, () => {
+        try { lanSock.setBroadcast(true) } catch {}
+        try { lanSock.addMembership(LAN_MCAST) } catch {}
+      })
+      const advertise = () => {
+        const payload = JSON.stringify({ _: 'c3', v: 1, room, port: mesh.port, n: nodeId })
+        try { lanSock.send(payload, LAN_DISCOVER_PORT, '255.255.255.255', () => {}) } catch {}
+        try { lanSock.send(payload, LAN_DISCOVER_PORT, LAN_MCAST, () => {}) } catch {}
+      }
+      advertise()
+      const iv = setInterval(advertise, 2000)
+      ui.set('looking for peers...')
+      await sleep(LAN_DISCOVER_MS)
+      clearInterval(iv)
+      if (!gotPeer) ui.say('No LAN peers found via UDP. If on same WiFi, share your --peer URL above.')
+    } catch (err) {
+      warnOnce('lan-fail', 'LAN discovery failed. Use --peer or --signal.')
+    }
+  }
 
   doc.on('update', (update, origin) => {
     if (origin === 'remote' || origin === 'restore') return
-    broadcast({ t: 'u', d: Buffer.from(update).toString('base64') })
+    mesh.broadcast({ t: 'u', d: Buffer.from(update).toString('base64') })
   })
 
   const hb = setInterval(() => {
-    broadcast({ t: 'h', name: me.name, email: me.email })
+    mesh.broadcast({ t: 'h', name: me.name, email: me.email })
     const now = Date.now()
-    for (const [k, v] of awarenessMap) if (now - v.ts > 15000) awarenessMap.delete(k)
+    for (const [k, v] of mesh.awareness) if (now - v.ts > 15000) mesh.awareness.delete(k)
   }, 5000)
 
   backend.prepare()
@@ -534,73 +562,13 @@ async function connect() {
   const persist = () => {
     clearTimeout(persistTimer)
     persistTimer = setTimeout(() => {
-      try {
-        atomicWrite(stateFile, Y.encodeStateAsUpdate(doc))
-        atomicWrite(genFile, backend.generation())
-      } catch {}
+      try { atomicWrite(stateFile, Y.encodeStateAsUpdate(doc)); atomicWrite(genFile, backend.generation()) } catch {}
     }, 3000)
   }
   doc.on('update', persist)
 
-  // LAN discovery (Windows uses multicast loopback fallback)
-  let lanSock
-  const explicitSignals = argv.filter((a, i) => a === '--signal' && argv[i + 1]).length
-  const wantLan = has('lan') || (explicitSignals === 0 && !config.signaling && !process.env.C3_SIGNALING)
-  if (wantLan && !process.env.C3_NO_LAN) {
-    const nodeId = crypto.randomBytes(4).toString('hex')
-    let gotPeer = false
-
-    try {
-      lanSock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
-
-      lanSock.on('error', err => {
-        if (IS_WIN && err.code === 'EPERM') {
-          warnOnce('lan-blocked', 'Windows firewall blocked UDP. Use --signal for remote peers.')
-        }
-      })
-
-      lanSock.on('message', (msg, rinfo) => {
-        let d; try { d = JSON.parse(msg) } catch { return }
-        if (d._ !== 'c3' || d.v !== 1 || d.room !== room || d.n === nodeId) return
-        const url = `ws://${rinfo.address}:${d.port}/${room}`
-        if (myEndpoints.has(url)) return
-        for (const c of connections) if (c._c3url === url && c.readyState <= WebSocket.OPEN) return
-        gotPeer = true
-        const ws = new WebSocket(url)
-        ws._c3url = url
-        ws.on('open', () => addConnection(ws))
-        ws.on('error', () => {})
-        ws.on('close', () => {})
-      })
-
-      const bindAddr = IS_WIN ? '127.0.0.1' : undefined
-      lanSock.bind(LAN_DISCOVER_PORT, bindAddr, () => {
-        if (!IS_WIN) lanSock.setBroadcast(true)
-      })
-
-      const advertise = () => {
-        const payload = JSON.stringify({ _: 'c3', v: 1, room, port: myPort, n: nodeId })
-        const dest = IS_WIN ? '127.0.0.1' : '255.255.255.255'
-        lanSock.send(payload, LAN_DISCOVER_PORT, dest, () => {})
-      }
-      advertise()
-      const iv = setInterval(advertise, 2000)
-      ui.set('looking for peers (LAN + internet)...')
-      await sleep(LAN_DISCOVER_MS)
-      clearInterval(iv)
-
-      if (IS_WIN && !gotPeer) {
-        ui.say('Windows: no LAN peers found. Use --signal for remote peers, or run inside WSL2.')
-      }
-    } catch (err) {
-      if (IS_WIN) {
-        warnOnce('lan-fail', 'LAN discovery failed on Windows. Use --signal for remote peers.')
-      }
-    }
-  }
-
   if (!restored) {
-    if (othersAlive() === 0 && files.size === 0) {
+    if (mesh.othersAlive() === 0 && files.size === 0) {
       const seed = backend.listShareable()
       let bytes = 0
       for (const rel of seed) { try { bytes += fs.statSync(path.join(workDir, rel)).size } catch {} }
@@ -609,7 +577,7 @@ async function connect() {
       ui.say(`No peers -- hosting from this directory (${seed.length} files).`)
       for (const rel of seed) syncFromDisk(rel, true)
     } else {
-      ui.say(othersAlive() ? `Joined session with ${othersAlive()} peer(s).` : 'No peers -- resuming local state.')
+      ui.say(mesh.othersAlive() ? `Joined session with ${mesh.othersAlive()} peer(s).` : 'No peers -- resuming local state.')
       reconcile()
     }
   }
@@ -619,19 +587,13 @@ async function connect() {
     const r = relOf(p)
     return r === '.git' || r.startsWith('.git/') || (c3InsideWork && (r === c3Rel || r.startsWith(c3Rel + '/')))
   }
-  chokidar.watch(workDir, {
-    ignoreInitial: true,
-    ignored: watcherIgnored,
-    awaitWriteFinish: { stabilityThreshold: 150 },
-  })
+  chokidar.watch(workDir, { ignoreInitial: true, ignored: watcherIgnored, awaitWriteFinish: { stabilityThreshold: 150 } })
     .on('add', p => syncFromDisk(relOf(p)))
     .on('change', p => syncFromDisk(relOf(p)))
     .on('unlink', p => { const r = relOf(p); if (backend.isShareable(r)) removeFromDoc(r) })
 
   const sessionMessage = () => {
-    const trailers = Array.from(awarenessMap.values())
-      .filter(u => u.email && u.email !== me.email)
-      .map(u => `Co-authored-by: ${u.name} <${u.email}>`)
+    const trailers = Array.from(mesh.awareness.values()).filter(u => u.email && u.email !== me.email).map(u => `Co-authored-by: ${u.name} <${u.email}>`)
     return `Session snapshot ${new Date().toISOString()}` + (trailers.length ? '\n\n' + trailers.join('\n') : '')
   }
   const verifyOk = () => {
@@ -657,10 +619,10 @@ async function connect() {
     clearInterval(relayMaintainer)
     ui.clear()
     try {
-      if (othersAlive() > 0) {
+      if (mesh.othersAlive() > 0) {
         atomicWrite(stateFile, Y.encodeStateAsUpdate(doc))
         atomicWrite(genFile, backend.generation())
-        ui.say(`Others still in session (${othersAlive()}) -- keeping local state, not saving.`)
+        ui.say(`Others still in session (${mesh.othersAlive()}) -- keeping local state, not saving.`)
       } else if (touched.size === 0) {
         ui.say('Nothing changed -- nothing to save.')
         fs.rmSync(stateFile, { force: true })
@@ -695,18 +657,13 @@ async function connect() {
       console.error('Save failed -- state kept locally:', err.message)
     } finally {
       if (lanSock) try { lanSock.close() } catch {}
-      server.clients.forEach(c => c.close())
-      httpServer.close()
-      if (upnpClient) {
-        try { await new Promise(r => upnpClient.unmap({ publicPort: myPort, privatePort: myPort, protocol: 'TCP' }, () => r())) } catch {}
-        try { upnpClient.destroy() } catch {}
-      }
+      mesh.destroy()
       process.exit(0)
     }
   }
 
   const tick = setInterval(() => {
-    const n = othersAlive()
+    const n = mesh.othersAlive()
     ui.set(`live - ${n} peer${n === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}`)
   }, 2000)
 
@@ -788,7 +745,7 @@ Pick 1/2/3`, isGit ? '1' : '2')
   console.log(`  c3 connect --name "${name}" --key ${key}`)
   ui.say('On the same Wi-Fi everyone can just run:  c3 connect')
   if (sig) ui.say('Remote peers use the relay(s) in config automatically.')
-  if (IS_WIN) ui.say('Windows: LAN discovery limited. Use --signal for best results, or run inside WSL2.')
+  if (IS_WIN) ui.say('Windows: LAN discovery limited. Use --peer for same-room sync, or run inside WSL2.')
 }
 
 // ---------- export ----------
@@ -817,12 +774,7 @@ async function doctor() {
   ok('Node 22+', Number(process.version.slice(1).split('.')[0]) >= 22, 'upgrade Node')
   ok('project config', fs.existsSync(CONFIG_FILE), 'run `c3 config`')
   let isIgnored = false
-  try {
-    execFileSync('git', ['check-ignore', '-q', 'c3/'], { cwd: workDir })
-    isIgnored = true
-  } catch {
-    isIgnored = false
-  }
+  try { execFileSync('git', ['check-ignore', '-q', 'c3/'], { cwd: workDir }); isIgnored = true } catch { isIgnored = false }
   ok('c3 ignored by git', isIgnored, `add "${c3Name}/" to .gitignore`)
   if (config) {
     try {
@@ -850,6 +802,7 @@ Flags:
   --name <n>        session name
   --key <k>         session key
   --signal <url>    add a relay (repeatable; also stored via config)
+  --peer <url>      connect directly to a peer URL (repeatable)
   --lan             force LAN discovery even with --signal
   --yes             auto-confirm publish
   --archive <type>  set backend (git | folder:<path> | none)
