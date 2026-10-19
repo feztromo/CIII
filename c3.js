@@ -1,15 +1,9 @@
-#!/usr/bin/env NODE_NO_WARNINGS=1 node
 // CIII (c3) -- P2P live session (git | folder | none).
 // Clone this folder into your project, add "c3/" to .gitignore, then:
 //   npm install
 //   node c3.js config
 //   node c3.js connect
 // Node 22+.
-
-process.on('warning', (w) => {
-  if (w.name === 'ExperimentalWarning' && w.message.includes('localStorage')) return
-  console.warn(w)
-})
 
 import * as Y from 'yjs'
 import chokidar from 'chokidar'
@@ -30,7 +24,12 @@ const cmd = argv[0]
 const flag = n => { const i = argv.indexOf('--' + n); return (i >= 0 && argv[i + 1]) ? argv[i + 1] : undefined }
 const has = n => argv.includes('--' + n)
 
-// ---------- paths: everything lives inside the cloned c3/ folder ----------
+// ---------- platform detection ----------
+const IS_WIN = process.platform === 'win32'
+const IS_MAC = process.platform === 'darwin'
+const IS_LINUX = process.platform === 'linux'
+
+// ---------- paths ----------
 const c3Dir = path.dirname(fileURLToPath(import.meta.url))
 const SESSION_DIR = path.join(c3Dir, '.c3')
 const CONFIG_FILE = path.join(SESSION_DIR, 'config.json')
@@ -57,16 +56,16 @@ const atomicWrite = (abs, data) => {
   fs.renameSync(abs + '.tmp-' + process.pid, abs)
 }
 
-// ---------- UI helpers (ASCII only) ----------
-const C = { r:'\x1b[0m', d:'\x1b[2m', red:'\x1b[31m', grn:'\x1b[32m', yel:'\x1b[33m', cyn:'\x1b[36m' }
+// ---------- UI ----------
+const C = IS_WIN ? { r:'', d:'', red:'', grn:'', yel:'', cyn:'' } : { r:'\x1b[0m', d:'\x1b[2m', red:'\x1b[31m', grn:'\x1b[32m', yel:'\x1b[33m', cyn:'\x1b[36m' }
 const verbose = () => !!process.env.C3_VERBOSE
 const log = (...a) => { if (verbose()) console.log(`${C.d}[${new Date().toLocaleTimeString()}]${C.r}`, ...a) }
 
 const ui = {
-  set(msg) { if (!verbose() && process.stdout.isTTY) process.stdout.write(`\r\x1b[K${C.cyn}* c3${C.r} ${msg}`) },
+  set(msg) { if (!verbose() && process.stdout.isTTY) process.stdout.write(`\r\x1b[K* c3${C.r} ${msg}`) },
   clear() { if (!verbose() && process.stdout.isTTY) process.stdout.write('\r\x1b[K') },
-  say(...a) { this.clear(); console.log(`${C.cyn}* c3${C.r}`, ...a) },
-  warn(...a) { this.clear(); console.error(`${C.yel}! warning${C.r}`, ...a) }
+  say(...a) { this.clear(); console.log(`* c3${C.r}`, ...a) },
+  warn(...a) { this.clear(); console.error(`! warning${C.r}`, ...a) }
 }
 
 const onceWarned = new Set()
@@ -105,7 +104,7 @@ function symlinkEscape(abs) {
 }
 
 // ---------- ignore ----------
-const DEFAULT_IGNORE = ['node_modules/', 'dist/', 'build/', 'out/', '.env*', '*.pem', 'id_rsa*', '*.log', '.DS_Store']
+const DEFAULT_IGNORE = ['node_modules/', 'dist/', 'build/', 'out/', '.env*', '*.pem', 'id_rsa*', '*.log', '.DS_Store', 'Thumbs.db', 'desktop.ini']
 function rulesMatcher() {
   const ig = ignore().add(DEFAULT_IGNORE)
   const f = path.join(SESSION_DIR, 'ignore')
@@ -127,9 +126,9 @@ function walkTree(isShareable) {
   return out
 }
 
-// ---------- optional UPnP so any peer can become a public relay ----------
+// ---------- UPnP (skip on Windows) ----------
 async function tryUpnp(port) {
-  if (process.env.C3_NO_UPNP) return null
+  if (IS_WIN || process.env.C3_NO_UPNP) return null
   try {
     const mod = await import('nat-api')
     const NatAPI = mod.default || mod
@@ -483,7 +482,7 @@ async function connect() {
     ws.on('error', () => activeRelays.delete(baseUrl))
   }
 
-  // ---------- try UPnP so we become a public relay ----------
+  // ---------- UPnP ----------
   const upnp = await tryUpnp(myPort)
   if (upnp) {
     upnpClient = upnp.client
@@ -543,35 +542,61 @@ async function connect() {
   }
   doc.on('update', persist)
 
-  // LAN discovery
+  // LAN discovery (Windows uses multicast loopback fallback)
   let lanSock
   const explicitSignals = argv.filter((a, i) => a === '--signal' && argv[i + 1]).length
   const wantLan = has('lan') || (explicitSignals === 0 && !config.signaling && !process.env.C3_SIGNALING)
   if (wantLan && !process.env.C3_NO_LAN) {
     const nodeId = crypto.randomBytes(4).toString('hex')
-    lanSock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
-    lanSock.on('message', (msg, rinfo) => {
-      let d; try { d = JSON.parse(msg) } catch { return }
-      if (d._ !== 'c3' || d.v !== 1 || d.room !== room || d.n === nodeId) return
-      const url = `ws://${rinfo.address}:${d.port}/${room}`
-      if (myEndpoints.has(url)) return
-      for (const c of connections) if (c._c3url === url && c.readyState <= WebSocket.OPEN) return
-      const ws = new WebSocket(url)
-      ws._c3url = url
-      ws.on('open', () => addConnection(ws))
-      ws.on('error', () => {})
-      ws.on('close', () => {})
-    })
-    lanSock.bind(LAN_DISCOVER_PORT, () => lanSock.setBroadcast(true))
-    const advertise = () => {
-      const payload = JSON.stringify({ _: 'c3', v: 1, room, port: myPort, n: nodeId })
-      lanSock.send(payload, LAN_DISCOVER_PORT, '255.255.255.255', () => {})
+    let gotPeer = false
+
+    try {
+      lanSock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+
+      lanSock.on('error', err => {
+        if (IS_WIN && err.code === 'EPERM') {
+          warnOnce('lan-blocked', 'Windows firewall blocked UDP. Use --signal for remote peers.')
+        }
+      })
+
+      lanSock.on('message', (msg, rinfo) => {
+        let d; try { d = JSON.parse(msg) } catch { return }
+        if (d._ !== 'c3' || d.v !== 1 || d.room !== room || d.n === nodeId) return
+        const url = `ws://${rinfo.address}:${d.port}/${room}`
+        if (myEndpoints.has(url)) return
+        for (const c of connections) if (c._c3url === url && c.readyState <= WebSocket.OPEN) return
+        gotPeer = true
+        const ws = new WebSocket(url)
+        ws._c3url = url
+        ws.on('open', () => addConnection(ws))
+        ws.on('error', () => {})
+        ws.on('close', () => {})
+      })
+
+      const bindAddr = IS_WIN ? '127.0.0.1' : undefined
+      lanSock.bind(LAN_DISCOVER_PORT, bindAddr, () => {
+        if (!IS_WIN) lanSock.setBroadcast(true)
+      })
+
+      const advertise = () => {
+        const payload = JSON.stringify({ _: 'c3', v: 1, room, port: myPort, n: nodeId })
+        const dest = IS_WIN ? '127.0.0.1' : '255.255.255.255'
+        lanSock.send(payload, LAN_DISCOVER_PORT, dest, () => {})
+      }
+      advertise()
+      const iv = setInterval(advertise, 2000)
+      ui.set('looking for peers (LAN + internet)...')
+      await sleep(LAN_DISCOVER_MS)
+      clearInterval(iv)
+
+      if (IS_WIN && !gotPeer) {
+        ui.say('Windows: no LAN peers found. Use --signal for remote peers, or run inside WSL2.')
+      }
+    } catch (err) {
+      if (IS_WIN) {
+        warnOnce('lan-fail', 'LAN discovery failed on Windows. Use --signal for remote peers.')
+      }
     }
-    advertise()
-    const iv = setInterval(advertise, 2000)
-    ui.set('looking for peers (LAN + internet)...')
-    await sleep(LAN_DISCOVER_MS)
-    clearInterval(iv)
   }
 
   if (!restored) {
@@ -763,6 +788,7 @@ Pick 1/2/3`, isGit ? '1' : '2')
   console.log(`  c3 connect --name "${name}" --key ${key}`)
   ui.say('On the same Wi-Fi everyone can just run:  c3 connect')
   if (sig) ui.say('Remote peers use the relay(s) in config automatically.')
+  if (IS_WIN) ui.say('Windows: LAN discovery limited. Use --signal for best results, or run inside WSL2.')
 }
 
 // ---------- export ----------
