@@ -778,7 +778,11 @@ async function doctor() {
   let config = null
   if (fs.existsSync(CONFIG_FILE)) { try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch {} }
   const lines = []
-  const ok = (n, c, hint) => lines.push(`${c ? `${C.grn}+${C.r}` : `${C.red}-${C.r}`} ${n}${c ? '' : ` -- ${hint}`}`)
+  let failed = false
+  const ok = (n, c, hint) => {
+    if (!c) failed = true
+    lines.push(`${c ? `${C.grn}+${C.r}` : `${C.red}-${C.r}`} ${n}${c ? '' : ` -- ${hint}`}`)
+  }
   ok('Node 22+', Number(process.version.slice(1).split('.')[0]) >= 22, 'upgrade Node')
   ok('project config', fs.existsSync(CONFIG_FILE), 'run `c3 config`')
   let isIgnored = false
@@ -797,8 +801,9 @@ async function doctor() {
       ok('session key present', fs.existsSync(path.join(stateDir(identity), 'key')), 'run `c3 config`')
     } catch (e) { ok('identity resolved', false, e.message) }
   }
-  ui.say(lines.join('\n'))
-  ui.say(lines.some(l => l.includes('- ')) ? 'Some checks failed.' : 'All good.')
+  ui.clear()
+  console.log(lines.join('\n'))
+  console.log(failed ? 'Some checks failed.' : 'All good.')
 }
 
 // ---------- dispatch ----------
