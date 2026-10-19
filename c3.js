@@ -778,7 +778,12 @@ async function doctor() {
   ok('Node 22+', Number(process.version.slice(1).split('.')[0]) >= 22, 'upgrade Node')
   ok('project config', fs.existsSync(CONFIG_FILE), 'run `c3 config`')
   let isIgnored = false
-  try { execFileSync('git', ['check-ignore', '-q', c3Name], { cwd: workDir }); isIgnored = true } catch { isIgnored = false }
+  try {
+    execFileSync('git', ['check-ignore', '-q', 'c3/'], { cwd: workDir })
+    isIgnored = true
+  } catch {
+    isIgnored = false
+  }
   ok('c3 ignored by git', isIgnored, `add "${c3Name}/" to .gitignore`)
   if (config) {
     try {
