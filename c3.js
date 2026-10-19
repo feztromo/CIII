@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import dgram from 'node:dgram'
+import { createServer } from 'node:http'
 import { WebSocketServer, WebSocket } from 'ws'
 
 const argv = process.argv.slice(2)
@@ -249,17 +250,17 @@ const touched = new Set()
 let backend = null
 
 function applyDiff(t, next) {
-  const cur = t.toString();
-  if (cur === next) return false;
-  let s = 0;
-  while (s < cur.length && s < next.length && cur[s] === next[s]) s++;
-  let e = 0;
+  const cur = t.toString()
+  if (cur === next) return false
+  let s = 0
+  while (s < cur.length && s < next.length && cur[s] === next[s]) s++
+  let e = 0
   while (e < cur.length - s && e < next.length - s && cur[cur.length - 1 - e] === next[next.length - 1 - e]) {
-    e++;
+    e++
   }
-  if (cur.length - s - e > 0) t.delete(s, cur.length - s - e);
-  if (next.length - s - e > 0) t.insert(s, next.slice(s, next.length - e));
-  return true;
+  if (cur.length - s - e > 0) t.delete(s, cur.length - s - e)
+  if (next.length - s - e > 0) t.insert(s, next.slice(s, next.length - e))
+  return true
 }
 
 function syncFromDisk(rel, seed = false) {
@@ -451,18 +452,17 @@ async function connect() {
     } catch {}
   }
 
-  const server = new WebSocketServer({ noServer: true })
   const httpServer = createServer()
+  const server = new WebSocketServer({ noServer: true })
   await new Promise(res => httpServer.listen(0, '0.0.0.0', res))
   const myPort = httpServer.address().port
-  httpServer.on('upgrade', (req, socket, head) => {
+  httpServer.on('upgrade', (req, sock, head) => {
     if (req.url === '/' + room) {
-      server.handleUpgrade(req, socket, head, ws => server.emit('connection', ws, req))
+      server.handleUpgrade(req, sock, head, ws => server.emit('connection', ws, req))
     } else {
-      socket.destroy()
+      sock.destroy()
     }
   })
-  server.on('connection', ws => addConnection(ws))
 
   myEndpoints.add(`ws://localhost:${myPort}/${room}`)
   myIps.forEach(ip => myEndpoints.add(`ws://${ip}:${myPort}/${room}`))
@@ -666,7 +666,7 @@ async function connect() {
     } finally {
       if (lanSock) try { lanSock.close() } catch {}
       server.clients.forEach(c => c.close())
-      server.close()
+      httpServer.close()
       if (upnpClient) {
         try { await new Promise(r => upnpClient.unmap({ publicPort: myPort, privatePort: myPort, protocol: 'TCP' }, () => r())) } catch {}
         try { upnpClient.destroy() } catch {}
