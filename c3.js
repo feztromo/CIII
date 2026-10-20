@@ -3,12 +3,12 @@
 //   npm install
 //   node c3.js config
 //   node c3.js connect
-// No host. No ports. No IPs. WebRTC finds peers through NAT automatically.
+// No host. No ports. No IPs. Peers find each other through a DHT
+// (same trick as BitTorrent) and sync directly, hole-punched, encrypted.
 // Node 22+.
 
 import * as Y from 'yjs'
-import { WebrtcProvider } from 'y-webrtc'
-import wrtc from '@roamhq/wrtc'
+import Hyperswarm from 'hyperswarm'
 import chokidar from 'chokidar'
 import ignore from 'ignore'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -22,11 +22,6 @@ import crypto from 'node:crypto'
 const argv = process.argv.slice(2)
 const cmd = argv[0]
 const flag = n => { const i = argv.indexOf('--' + n); return (i >= 0 && argv[i + 1]) ? argv[i + 1] : undefined }
-const flags = n => {
-  const out = []
-  for (let i = 0; i < argv.length - 1; i++) if (argv[i] === '--' + n && argv[i + 1]) out.push(argv[i + 1])
-  return out
-}
 const has = n => argv.includes('--' + n)
 
 const IS_WIN = process.platform === 'win32'
@@ -42,22 +37,10 @@ const c3Rel = path.relative(workDir, c3Dir).split(path.sep).join('/')
 const c3InsideWork = !c3Rel.startsWith('..') && !path.isAbsolute(c3Rel)
 const c3Name = path.basename(c3Dir)
 
-// Free public signaling servers. They only introduce peers to each other.
-// Data flows P2P after handshake. Redundant: any one working is enough.
-const DEFAULT_SIGNALING = [
-  'wss://signaling.yjs.dev',
-  'wss://y-webrtc-signaling-eu.fly.dev',
-]
-const STUN = [
-  'stun:stun.l.google.com:19302',
-  'stun:stun1.l.google.com:19302',
-  'stun:stun.cloudflare.com:3478',
-]
-
 const MAX_FILE = 16 << 20
 const SEED_FILES = 10_000
 const SEED_BYTES = 200 << 20
-const PEER_WAIT_MS = 5000
+const PEER_WAIT_MS = 4000
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const die = m => { console.error(m); process.exit(1) }
@@ -322,6 +305,22 @@ function reconcile() {
     if (!files.has(rel)) fs.rmSync(path.join(workDir, rel), { force: true })
 }
 
+// ---------- wire protocol (newline-delimited JSON over DHT streams) ----------
+function frame(obj) { return Buffer.from(JSON.stringify(obj) + '\n') }
+function makeDecoder(onMsg) {
+  let buf = ''
+  return data => {
+    buf += data.toString('utf8')
+    let idx
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx)
+      buf = buf.slice(idx + 1)
+      if (!line.trim()) continue
+      try { onMsg(JSON.parse(line)) } catch {}
+    }
+  }
+}
+
 // ---------- connect ----------
 async function connect() {
   let config
@@ -343,45 +342,55 @@ async function connect() {
   if (key.length < 20) ui.warn('key looks low-entropy -- prefer a generated one.')
   if (flag('key')) { atomicWrite(keyFile, key); fs.chmodSync(keyFile, 0o600) }
 
-  // Room: same name+key = same room on any machine. Signaling sees only the hash.
-  const room = 'c3-' + crypto.createHash('sha256').update(identity + '\0' + key).digest('hex').slice(0, 24)
-
-  const signaling = [
-    ...flags('signal'),
-    ...(config.signaling || []),
-    ...(process.env.C3_SIGNALING ? process.env.C3_SIGNALING.split(',').map(s => s.trim()).filter(Boolean) : []),
-    ...DEFAULT_SIGNALING,
-  ].filter((v, i, a) => a.indexOf(v) === i)
+  // Topic: same name+key = same swarm on any machine. The DHT sees only this hash.
+  const topic = crypto.createHash('sha256').update(identity + '\0' + key).digest()
 
   const me = {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'unknown'),
     email: gitOk('config', 'user.email') ?? `${os.userInfo().username}@${os.hostname()}`,
   }
-  const meId = me.email || me.name
+  const meId = crypto.randomBytes(8).toString('hex') // unique per process
 
-  // WebRTC: P2P data channels, automatic NAT traversal via STUN.
-  // Signaling servers only introduce peers; they never see data.
-  // password encrypts all session traffic end-to-end.
-  const provider = new WebrtcProvider(room, doc, {
-    signaling,
-    password: key,
-    peerOpts: {
-      wrtc,
-      config: { iceServers: [{ urls: STUN }] },
-    },
+  const swarm = new Hyperswarm()
+  const conns = new Set()
+  const awareness = new Map() // id -> { name, email, ts }
+  const othersAlive = () => {
+    let n = 0
+    for (const [k] of awareness) if (k !== meId) n++
+    return n
+  }
+
+  const broadcast = obj => {
+    const payload = frame(obj)
+    for (const conn of conns) { try { conn.write(payload) } catch {} }
+  }
+
+  swarm.on('connection', (conn, info) => {
+    conns.add(conn)
+    conn._c3PeerId = null   // set when their first heartbeat arrives
+    conn.on('data', makeDecoder(m => {
+      if (m.t === 'u' || m.t === 's') {
+        try { Y.applyUpdate(doc, Buffer.from(m.d, 'base64'), 'remote') } catch {}
+      } else if (m.t === 'h') {
+        awareness.set(m.id, { name: m.name, email: m.email, ts: Date.now() })
+        conn._c3PeerId = m.id   // remember who owns this socket
+      }
+    }))
+    conn.on('close', () => {
+      conns.delete(conn)
+      if (conn._c3PeerId) awareness.delete(conn._c3PeerId)  // instant goodbye
+    })
+    conn.on('error', () => conns.delete(conn))
+    try {
+      conn.write(frame({ t: 's', d: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }))
+      conn.write(frame({ t: 'h', id: meId, name: me.name, email: me.email }))
+    } catch {}
   })
 
-  const seen = new Map([[meId, me]])
-  provider.awareness.setLocalStateField('user', me)
-  provider.awareness.on('change', () => {
-    for (const s of provider.awareness.getStates().values())
-      if (s.user) seen.set(s.user.email || s.user.name, s.user)
-  })
-  const othersAlive = () => Math.max(0, provider.awareness.getStates().size - 1)
-
-  provider.on('status', ({ status }) => {
-    if (status === 'connected') ui.say('Connected to signaling. Waiting for peers...')
-  })
+  // announce + look for peers with the same topic
+  const discovery = swarm.join(topic, { server: true, client: true })
+  process.once('SIGINT', () => swarm.destroy())
+  process.once('SIGTERM', () => swarm.destroy())
 
   backend.prepare()
 
@@ -410,7 +419,8 @@ async function connect() {
   }
   doc.on('update', persist)
 
-  ui.set('looking for peers...')
+  ui.set('looking for peers through the DHT...')
+  try { await swarm.flush() } catch {}
   await sleep(PEER_WAIT_MS)
 
   if (!restored) {
@@ -428,6 +438,18 @@ async function connect() {
     }
   }
 
+  doc.on('update', (update, origin) => {
+    if (origin === 'remote' || origin === 'restore') return
+    if (conns.size === 0) return
+    broadcast({ t: 'u', d: Buffer.from(update).toString('base64') })
+  })
+
+  const hb = setInterval(() => {
+    broadcast({ t: 'h', id: meId, name: me.name, email: me.email })
+    const now = Date.now()
+    for (const [k, v] of awareness) if (now - v.ts > 12000) awareness.delete(k)
+  }, 4000)
+
   const relOf = p => path.relative(workDir, p).split(path.sep).join('/')
   const watcherIgnored = p => {
     const r = relOf(p)
@@ -444,7 +466,7 @@ async function connect() {
     .on('unlink', p => { const r = relOf(p); if (backend.isShareable(r)) removeFromDoc(r) })
 
   const sessionMessage = () => {
-    const trailers = [...seen.values()]
+    const trailers = [...awareness.values()]
       .filter(u => u.email && u.email !== me.email)
       .map(u => `Co-authored-by: ${u.name} <${u.email}>`)
     return `Session snapshot ${new Date().toISOString()}` + (trailers.length ? '\n\n' + trailers.join('\n') : '')
@@ -468,6 +490,7 @@ async function connect() {
     if (leaving) return
     leaving = true
     clearTimeout(persistTimer)
+    clearInterval(hb)
     ui.clear()
     try {
       if (othersAlive() > 0) {
@@ -507,7 +530,7 @@ async function connect() {
       try { atomicWrite(stateFile, Y.encodeStateAsUpdate(doc)); atomicWrite(genFile, backend.generation()) } catch {}
       console.error('Save failed -- state kept locally:', err.message)
     } finally {
-      provider.destroy()
+      try { await swarm.destroy() } catch {}
       process.exit(0)
     }
   }
@@ -611,11 +634,6 @@ function exportCmd() {
 async function doctor() {
   let config = null
   if (fs.existsSync(CONFIG_FILE)) { try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch {} }
-  const sig = [...new Set([
-    ...(config?.signaling || []),
-    ...(process.env.C3_SIGNALING ? process.env.C3_SIGNALING.split(',').map(s => s.trim()).filter(Boolean) : []),
-    ...DEFAULT_SIGNALING,
-  ])]
 
   const lines = []
   let failed = false
@@ -636,14 +654,18 @@ async function doctor() {
       ok('session key present', fs.existsSync(path.join(stateDir(identity), 'key')), 'run `c3 config`')
     } catch (e) { ok('identity resolved', false, e.message) }
   }
-  for (const url of sig) {
-    ok(`signaling ${url}`, await new Promise(res => {
-      const ws = new WebSocket(url)
-      const t = setTimeout(() => { try { ws.close() } catch {}; res(false) }, 4000)
-      ws.onopen = () => { clearTimeout(t); ws.close(); res(true) }
-      ws.onerror = () => { clearTimeout(t); res(false) }
-    }), 'unreachable (ok if another server works)')
-  }
+  // DHT smoke test: join a throwaway topic and see if the DHT responds
+  ok('DHT reachable', await new Promise(res => {
+    const s = new Hyperswarm()
+    const t = setTimeout(() => { s.destroy().catch(() => {}); res(false) }, 8000)
+    try {
+      const d = s.join(crypto.randomBytes(32))
+      d.on('update', () => { clearTimeout(t); s.destroy().catch(() => {}); res(true) })
+      s.flush().catch(() => {})
+    } catch {
+      clearTimeout(t); res(false)
+    }
+  }), 'no DHT response -- check firewall allows outbound UDP')
   ui.clear()
   console.log(lines.join('\n'))
   console.log(failed ? 'Some checks failed.' : 'All good.')
@@ -656,24 +678,23 @@ Commands:
   config    interactive wizard (once per project)
   connect   join/start live session
   export    copy tree to directory (save for backend "none")
-  doctor    diagnose config, key, and connectivity
+  doctor    diagnose config, key, and DHT connectivity
 
 Flags:
   --name <n>        session name
   --key <k>         session key
-  --signal <url>    extra signaling server (repeatable)
   --yes             auto-confirm publish
   --archive <type>  set backend (git | folder:<path> | none)
 
 How it works:
-  Peers find each other via public signaling servers, then sync
-  directly peer-to-peer over WebRTC (encrypted, NAT-traversing).
-  No host, no ports, no IP addresses. Same session name + key
-  on any machine = same room.
+  Peers find each other through a distributed hash table (the same
+  trick BitTorrent uses), then sync directly peer-to-peer. Every
+  connection is encrypted end to end. No host, no ports, no IPs,
+  no signaling servers. Same session name + key on any machine
+  = same room.
 
 Advanced options (edit .c3/config.json directly):
-  "verify": "npm test"                          run before publishing
-  "signaling": ["wss://my-relay.example.com"]   extra signaling servers
+  "verify": "npm test"    run this command before publishing
 `
 
 if (cmd === 'config') await configCmd()

@@ -10,8 +10,9 @@ No dedicated host or port forwarding is required. Peers discover each other thro
 
 ```bash
 # Clone into your project 
-cd my-project && echo c3/ >> .gitignore
+cd my-project
 git clone https://github.com/feztromo/ciii.git c3
+echo c3/ >> .gitignore
 
 # Install dependencies
 cd c3 && npm install
