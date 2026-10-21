@@ -6,6 +6,9 @@
 // No host. No ports. No IPs. Peers find each other through a DHT
 // (same trick as BitTorrent) and sync directly, hole-punched, encrypted.
 // Node 22+.
+//
+// Wire protocol v2 (binary, length-prefixed). Not compatible with older
+// c3 versions: everyone in a session must run this version.
 
 import * as Y from 'yjs'
 import Hyperswarm from 'hyperswarm'
@@ -38,9 +41,12 @@ const c3InsideWork = !c3Rel.startsWith('..') && !path.isAbsolute(c3Rel)
 const c3Name = path.basename(c3Dir)
 
 const MAX_FILE = 16 << 20
+const MAX_FRAME = 1 << 29          // 512 MB hard cap on a single wire frame
 const SEED_FILES = 10_000
 const SEED_BYTES = 200 << 20
-const PEER_WAIT_MS = 4000
+const PEER_WAIT_MS = 2500          // only waited when no peer answers sooner
+const WRITE_DEBOUNCE_MS = 40       // coalesce bursts of remote edits per file
+const PROTOCOL = 'c3v2'            // mixed into the topic so old clients never meet new ones
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const die = m => { console.error(m); process.exit(1) }
@@ -62,7 +68,19 @@ function warnOnce(key, ...a) { if (!onceWarned.has(key)) { onceWarned.add(key); 
 
 const git = (...a) => execFileSync('git', a, { cwd: workDir, encoding: 'utf8', maxBuffer: 1 << 26 }).trim()
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
-const isGitIgnored = rel => { try { git('check-ignore', '-q', rel); return true } catch { return false } }
+
+// git check-ignore spawns a process, so remember the answers.
+// The cache is cleared whenever .gitignore changes (see the watcher).
+const ignoredCache = new Map()
+const isGitIgnored = rel => {
+  let v = ignoredCache.get(rel)
+  if (v === undefined) {
+    try { git('check-ignore', '-q', rel); v = true } catch { v = false }
+    if (ignoredCache.size > 50_000) ignoredCache.clear()
+    ignoredCache.set(rel, v)
+  }
+  return v
+}
 
 const readId = () => { try { return fs.readFileSync(ID_FILE, 'utf8').trim() } catch { return null } }
 const ensureId = () => { mkdirp(SESSION_DIR); if (!readId()) atomicWrite(ID_FILE, crypto.randomUUID()); return readId() }
@@ -94,16 +112,18 @@ function rulesMatcher() {
   const ig = ignore().add(DEFAULT_IGNORE)
   const f = path.join(SESSION_DIR, 'ignore')
   if (fs.existsSync(f)) ig.add(fs.readFileSync(f, 'utf8'))
-  return rel => !ig.ignores(rel)
+  // true = shareable. Never throws on odd paths.
+  return rel => { try { return !ig.ignores(rel) } catch { return true } }
 }
-function walkTree(isShareable) {
+// dirOk lets us skip whole ignored directories (node_modules etc.) without reading them.
+function walkTree(isShareable, dirOk = () => true) {
   const out = []
   const walk = (abs, rel) => {
     for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
       if (e.name === '.git') continue
-      if (c3InsideWork && e.name === c3Name) continue
+      if (c3InsideWork && e.name === c3Name && abs === workDir) continue
       const r = rel ? rel + '/' + e.name : e.name
-      if (e.isDirectory()) walk(path.join(abs, e.name), r)
+      if (e.isDirectory()) { if (dirOk(r)) walk(path.join(abs, e.name), r) }
       else if (e.isFile() && isShareable(r)) out.push(r)
     }
   }
@@ -117,6 +137,7 @@ function makeBackend(config) {
   if (config.backend === 'git') {
     return {
       kind: 'git',
+      excluded: null,
       identity() {
         const u = gitOk('remote', 'get-url', 'origin')
         if (u) return canonUrl(u)
@@ -150,17 +171,20 @@ function makeBackend(config) {
     const lock = path.join(archive, '.c3-lock')
     const insideWork = archive.startsWith(workDir + path.sep)
     const relArchive = insideWork ? path.relative(workDir, archive).split(path.sep).join('/') : null
+    const inArchive = rel => !!relArchive && (rel === relArchive || rel.startsWith(relArchive + '/'))
+    const dirOk = d => !inArchive(d) && rules(d + '/')
     return {
       kind: 'folder',
+      excluded: relArchive,
       identity: () => readId() ?? die('folder backend needs .c3/id -- run c3 config or pass --name'),
       prepare() {
         mkdirp(path.join(archive, 'snapshots'))
         if (archive === workDir) die('archive path cannot be the working dir itself; use backend "none" for that')
         if (insideWork) ui.say('archive folder is inside the working tree (excluded from sync).')
       },
-      listShareable() { return walkTree(r => this.isShareable(r)) },
+      listShareable() { return walkTree(r => this.isShareable(r), dirOk) },
       isShareable(rel) {
-        if (relArchive && (rel === relArchive || rel.startsWith(relArchive + '/'))) return false
+        if (inArchive(rel)) return false
         return rules(rel)
       },
       generation() { try { return fs.readFileSync(path.join(archive, 'gen'), 'utf8').trim() } catch { return '0' } },
@@ -176,7 +200,7 @@ function makeBackend(config) {
         try {
           const ts = new Date().toISOString().replace(/[:.]/g, '-')
           const snap = path.join(archive, 'snapshots', ts)
-          const list = walkTree(r => this.isShareable(r))
+          const list = walkTree(r => this.isShareable(r), dirOk)
           for (const rel of list) {
             mkdirp(path.dirname(path.join(snap, rel)))
             fs.copyFileSync(path.join(workDir, rel), path.join(snap, rel))
@@ -191,9 +215,10 @@ function makeBackend(config) {
   if (config.backend === 'none') {
     return {
       kind: 'none',
+      excluded: null,
       identity: () => readId() ?? die('backend "none" has no identity channel -- pass --name or run c3 config'),
       prepare() {},
-      listShareable() { return walkTree(rules) },
+      listShareable() { return walkTree(rules, d => rules(d + '/')) },
       isShareable: rules,
       generation: () => 'static',
       save() { return { saved: false, exported: false } },
@@ -204,11 +229,15 @@ function makeBackend(config) {
 
 // ---------- Yjs state ----------
 const doc = new Y.Doc()
-const files = doc.getMap('files')
-const texts = doc.getMap('texts')
-const blobs = doc.getMap('blobs')
+const files = doc.getMap('files')   // path -> { id, bin }
+const texts = doc.getMap('texts')   // id -> Y.Text
+const blobs = doc.getMap('blobs')   // id -> Uint8Array (raw bytes, no base64)
 const touched = new Set()
 let backend = null
+
+// id -> path index, so content events don't scan every file
+const idToPath = new Map()
+const pathOf = id => idToPath.get(id)
 
 function applyDiff(t, next) {
   const cur = t.toString()
@@ -224,9 +253,12 @@ function applyDiff(t, next) {
   return true
 }
 
+const asBuf = u => Buffer.from(u.buffer, u.byteOffset, u.byteLength)
+
 function syncFromDisk(rel, seed = false) {
   const norm = safeRel(rel)
-  if (!norm || !backend.isShareable(norm)) return
+  // when seeding, listShareable() has already filtered; skip the per-file git spawn
+  if (!norm || (!seed && !backend.isShareable(norm))) return
   let buf
   try { buf = fs.readFileSync(path.join(workDir, norm)) } catch { return }
   doc.transact(() => {
@@ -235,12 +267,15 @@ function syncFromDisk(rel, seed = false) {
       const bin = buf.includes(0)
       const id = crypto.randomUUID()
       files.set(norm, { id, bin })
-      if (bin) blobs.set(id, buf.toString('base64'))
+      if (bin) blobs.set(id, new Uint8Array(buf))
       else texts.set(id, new Y.Text(buf.toString('utf8')))
       if (!seed) touched.add(norm)
     } else if (entry.bin) {
-      const b64 = buf.toString('base64')
-      if (blobs.get(entry.id) !== b64) { blobs.set(entry.id, b64); if (!seed) touched.add(norm) }
+      const cur = blobs.get(entry.id)
+      if (!cur || Buffer.compare(asBuf(cur), buf) !== 0) {
+        blobs.set(entry.id, new Uint8Array(buf))
+        if (!seed) touched.add(norm)
+      }
     } else {
       const t = texts.get(entry.id)
       if (t && applyDiff(t, buf.toString('utf8')) && !seed) touched.add(norm)
@@ -266,7 +301,13 @@ function writeToDisk(rawRel) {
   if (!rel || rel !== rawRel) { warnOnce('unsafe-' + rawRel, 'blocked unsafe path from peer:', rawRel); return }
   const abs = path.join(workDir, rel)
   if (symlinkEscape(abs)) { warnOnce('symlink', 'blocked symlink escape:', rel); return }
-  const data = entry.bin ? Buffer.from(blobs.get(entry.id) ?? '', 'base64') : Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
+  let data
+  if (entry.bin) {
+    const b = blobs.get(entry.id)
+    data = b ? asBuf(b) : Buffer.alloc(0)
+  } else {
+    data = Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
+  }
   if (data.length > MAX_FILE) { warnOnce('big-' + rel, 'blocked oversized file from peer:', rel); return }
   try {
     if (fs.existsSync(abs) && Buffer.compare(fs.readFileSync(abs), data) === 0) return
@@ -276,23 +317,52 @@ function writeToDisk(rawRel) {
   } catch (err) { warnOnce('write-' + rel, 'write failed:', rel, err.message) }
 }
 
-const pathOf = id => { for (const [p, e] of files) if (e.id === id) return p }
+// Debounced writes: a peer typing fast produces one disk write per file per
+// WRITE_DEBOUNCE_MS instead of one per keystroke.
+const pendingWrites = new Map()
+function scheduleWrite(rel) {
+  clearTimeout(pendingWrites.get(rel))
+  pendingWrites.set(rel, setTimeout(() => { pendingWrites.delete(rel); writeToDisk(rel) }, WRITE_DEBOUNCE_MS))
+}
+function cancelWrite(rel) {
+  clearTimeout(pendingWrites.get(rel))
+  pendingWrites.delete(rel)
+}
+function flushWrites() {
+  for (const [rel, t] of pendingWrites) { clearTimeout(t); writeToDisk(rel) }
+  pendingWrites.clear()
+}
+
 const remote = tx => tx.origin !== 'disk' && tx.origin !== 'restore'
 
 files.observe(ev => {
+  // keep the id index current for every kind of change (local, remote, restore)
+  for (const [key, change] of ev.keys) {
+    if (change.action === 'delete') {
+      const old = change.oldValue
+      if (old?.id && idToPath.get(old.id) === key) idToPath.delete(old.id)
+    } else {
+      const entry = files.get(key)
+      if (change.action === 'update' && change.oldValue?.id && change.oldValue.id !== entry?.id) idToPath.delete(change.oldValue.id)
+      if (entry?.id) idToPath.set(entry.id, key)
+    }
+  }
   if (!remote(ev.transaction)) return
   for (const [rawRel, change] of ev.keys) {
     const rel = safeRel(rawRel)
     if (!rel) { warnOnce('unsafe-' + rawRel, 'blocked unsafe path from peer:', rawRel); continue }
-    if (change.action === 'delete') { touched.add(rel); fs.rmSync(path.join(workDir, rel), { force: true }) }
-    else { touched.add(rel); writeToDisk(rawRel) }
+    if (change.action === 'delete') {
+      touched.add(rel)
+      cancelWrite(rel)
+      fs.rmSync(path.join(workDir, rel), { force: true })
+    } else { touched.add(rel); scheduleWrite(rawRel) }
   }
 })
 const onContent = evs => {
   if (!remote(evs[0].transaction)) return
   for (const ev of evs) {
     const ids = ev.target === texts || ev.target === blobs ? [...ev.keys.keys()] : [ev.path[0]]
-    for (const id of ids) { const p = pathOf(id); if (p) { touched.add(p); writeToDisk(p) } }
+    for (const id of ids) { const p = pathOf(id); if (p) { touched.add(p); scheduleWrite(p) } }
   }
 }
 texts.observeDeep(onContent)
@@ -305,19 +375,46 @@ function reconcile() {
     if (!files.has(rel)) fs.rmSync(path.join(workDir, rel), { force: true })
 }
 
-// ---------- wire protocol (newline-delimited JSON over DHT streams) ----------
-function frame(obj) { return Buffer.from(JSON.stringify(obj) + '\n') }
-function makeDecoder(onMsg) {
-  let buf = ''
+// ---------- wire protocol v2: [u32 length][u8 type][payload] ----------
+// length covers the type byte plus the payload. Raw bytes, no base64, no JSON
+// except for the tiny heartbeat.
+const T_UPDATE = 1   // incremental Yjs update
+const T_STATE = 2    // diff reply to a state vector (also an update)
+const T_VECTOR = 3   // "here is what I already have, send me the rest"
+const T_HELLO = 4    // heartbeat / awareness, JSON payload
+
+function frame(type, payload) {
+  const body = payload ? asBuf(payload) : Buffer.alloc(0)
+  const head = Buffer.allocUnsafe(5)
+  head.writeUInt32BE(body.length + 1, 0)
+  head[4] = type
+  return Buffer.concat([head, body])
+}
+function makeDecoder(onMsg, onBad) {
+  let chunks = []
+  let have = 0
+  let need = null
   return data => {
-    buf += data.toString('utf8')
-    let idx
-    while ((idx = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, idx)
-      buf = buf.slice(idx + 1)
-      if (!line.trim()) continue
-      try { onMsg(JSON.parse(line)) } catch {}
-    }
+    try {
+      chunks.push(data); have += data.length
+      for (;;) {
+        if (need === null) {
+          if (have < 4) return
+          const head = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)
+          chunks = [head]
+          need = head.readUInt32BE(0)
+          if (need < 1 || need > MAX_FRAME) throw new Error('bad frame length')
+        }
+        if (have < 4 + need) return
+        const all = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)
+        const body = all.subarray(4, 4 + need)
+        const rest = all.subarray(4 + need)
+        chunks = rest.length ? [rest] : []
+        have = rest.length
+        need = null
+        onMsg(body[0], body.subarray(1))
+      }
+    } catch { onBad() }
   }
 }
 
@@ -343,7 +440,7 @@ async function connect() {
   if (flag('key')) { atomicWrite(keyFile, key); fs.chmodSync(keyFile, 0o600) }
 
   // Topic: same name+key = same swarm on any machine. The DHT sees only this hash.
-  const topic = crypto.createHash('sha256').update(identity + '\0' + key).digest()
+  const topic = crypto.createHash('sha256').update(PROTOCOL + '\0' + identity + '\0' + key).digest()
 
   const me = {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'unknown'),
@@ -360,39 +457,59 @@ async function connect() {
     return n
   }
 
-  const broadcast = obj => {
-    const payload = frame(obj)
+  const broadcast = payload => {
     for (const conn of conns) { try { conn.write(payload) } catch {} }
   }
+  const helloFrame = () => frame(T_HELLO, Buffer.from(JSON.stringify({ id: meId, name: me.name, email: me.email })))
 
-  swarm.on('connection', (conn, info) => {
+  // resolves as soon as the first state diff from any peer has been applied
+  let stateReceived
+  const stateP = new Promise(r => { stateReceived = r })
+
+  swarm.on('connection', conn => {
     conns.add(conn)
     conn._c3PeerId = null   // set when their first heartbeat arrives
-    conn.on('data', makeDecoder(m => {
-      if (m.t === 'u' || m.t === 's') {
-        try { Y.applyUpdate(doc, Buffer.from(m.d, 'base64'), 'remote') } catch {}
-      } else if (m.t === 'h') {
-        awareness.set(m.id, { name: m.name, email: m.email, ts: Date.now() })
-        conn._c3PeerId = m.id   // remember who owns this socket
+    conn.on('data', makeDecoder((type, payload) => {
+      if (type === T_UPDATE || type === T_STATE) {
+        try { Y.applyUpdate(doc, payload, 'remote') } catch {}
+        if (type === T_STATE) stateReceived()
+      } else if (type === T_VECTOR) {
+        // send only what the peer is missing
+        try { conn.write(frame(T_STATE, Y.encodeStateAsUpdate(doc, payload))) } catch {}
+      } else if (type === T_HELLO) {
+        try {
+          const m = JSON.parse(payload.toString('utf8'))
+          awareness.set(m.id, { name: m.name, email: m.email, ts: Date.now() })
+          conn._c3PeerId = m.id   // remember who owns this socket
+        } catch {}
       }
-    }))
+    }, () => conn.destroy()))
     conn.on('close', () => {
       conns.delete(conn)
       if (conn._c3PeerId) awareness.delete(conn._c3PeerId)  // instant goodbye
     })
     conn.on('error', () => conns.delete(conn))
     try {
-      conn.write(frame({ t: 's', d: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }))
-      conn.write(frame({ t: 'h', id: meId, name: me.name, email: me.email }))
+      // hello first so the peer counts us before our state diff lands
+      conn.write(helloFrame())
+      conn.write(frame(T_VECTOR, Y.encodeStateVector(doc)))
     } catch {}
   })
 
   // announce + look for peers with the same topic
-  const discovery = swarm.join(topic, { server: true, client: true })
-  process.once('SIGINT', () => swarm.destroy())
-  process.once('SIGTERM', () => swarm.destroy())
+  swarm.join(topic, { server: true, client: true })
+  const earlyExit = () => { swarm.destroy().catch(() => {}).finally(() => process.exit(0)) }
+  process.once('SIGINT', earlyExit)
+  process.once('SIGTERM', earlyExit)
 
   backend.prepare()
+
+  // broadcast local changes (registered before seeding so a seed reaches early joiners)
+  doc.on('update', (update, origin) => {
+    if (origin === 'remote' || origin === 'restore') return
+    if (conns.size === 0) return
+    broadcast(frame(T_UPDATE, update))
+  })
 
   // crash-state restore with generation guard
   const stateFile = path.join(sdir, 'state.bin')
@@ -420,8 +537,12 @@ async function connect() {
   doc.on('update', persist)
 
   ui.set('looking for peers through the DHT...')
-  try { await swarm.flush() } catch {}
-  await sleep(PEER_WAIT_MS)
+  // Go as soon as a peer hands us state. Otherwise wait for the DHT lookup to
+  // finish plus a short grace period, then assume we are the host.
+  await Promise.race([
+    stateP,
+    swarm.flush().catch(() => {}).then(() => sleep(PEER_WAIT_MS)),
+  ])
 
   if (!restored) {
     if (othersAlive() === 0 && files.size === 0) {
@@ -431,36 +552,58 @@ async function connect() {
       if (!config.forceSeed && (seed.length > SEED_FILES || bytes > SEED_BYTES))
         die(`Refusing to seed ${seed.length} files / ${(bytes / 1e6).toFixed(0)} MB. Trim c3/.c3/ignore, or set "forceSeed": true in config.`)
       ui.say(`No peers -- hosting from this directory (${seed.length} files).`)
-      for (const rel of seed) syncFromDisk(rel, true)
+      // one transaction = one Yjs update for the whole seed
+      doc.transact(() => { for (const rel of seed) syncFromDisk(rel, true) }, 'disk')
     } else {
       ui.say(othersAlive() ? `Joined session with ${othersAlive()} peer(s).` : 'No peers yet -- waiting.')
       if (othersAlive() > 0) reconcile()
     }
   }
 
-  doc.on('update', (update, origin) => {
-    if (origin === 'remote' || origin === 'restore') return
-    if (conns.size === 0) return
-    broadcast({ t: 'u', d: Buffer.from(update).toString('base64') })
-  })
-
   const hb = setInterval(() => {
-    broadcast({ t: 'h', id: meId, name: me.name, email: me.email })
+    broadcast(helloFrame())
     const now = Date.now()
     for (const [k, v] of awareness) if (now - v.ts > 12000) awareness.delete(k)
   }, 4000)
 
+  // ---- file watcher: filter at the watcher so ignored trees are never walked ----
+  const watchRules = rulesMatcher()
+  const loadGitignore = () => {
+    if (backend.kind !== 'git') return null
+    try { return ignore().add(fs.readFileSync(path.join(workDir, '.gitignore'), 'utf8')) } catch { return null }
+  }
+  // Root .gitignore only, and only used to prune whole paths from the watcher.
+  // isShareable (with real git check-ignore) stays the final authority.
+  let rootGitignore = loadGitignore()
+
   const relOf = p => path.relative(workDir, p).split(path.sep).join('/')
   const watcherIgnored = p => {
     const r = relOf(p)
-    return r === '.git' || r.startsWith('.git/') || (c3InsideWork && (r === c3Rel || r.startsWith(c3Rel + '/')))
+    if (!r) return false
+    if (r === '.git' || r.startsWith('.git/')) return true
+    if (c3InsideWork && (r === c3Rel || r.startsWith(c3Rel + '/'))) return true
+    if (backend.excluded && (r === backend.excluded || r.startsWith(backend.excluded + '/'))) return true
+    try {
+      if (!watchRules(r) || !watchRules(r + '/')) return true
+      if (rootGitignore && rootGitignore.ignores(r + '/')) return true
+    } catch {}
+    return false
   }
-  chokidar.watch(workDir, { ignoreInitial: true, ignored: watcherIgnored, awaitWriteFinish: { stabilityThreshold: 150 } })
-    .on('add', p => syncFromDisk(relOf(p)))
+  const onGitignoreChange = r => {
+    if (r === '.gitignore') { ignoredCache.clear(); rootGitignore = loadGitignore() }
+  }
+  chokidar.watch(workDir, {
+    ignoreInitial: true,
+    ignored: watcherIgnored,
+    awaitWriteFinish: { stabilityThreshold: 50, pollInterval: 25 },
+  })
+    .on('add', p => { const r = relOf(p); onGitignoreChange(r); syncFromDisk(r) })
     .on('change', p => {
       const r = relOf(p)
+      onGitignoreChange(r)
       const recent = lastWritten.get(r)
       if (recent && Date.now() - recent < 500) return
+      if (pendingWrites.has(r)) return   // a newer remote version is about to land
       syncFromDisk(r)
     })
     .on('unlink', p => { const r = relOf(p); if (backend.isShareable(r)) removeFromDoc(r) })
@@ -491,6 +634,7 @@ async function connect() {
     leaving = true
     clearTimeout(persistTimer)
     clearInterval(hb)
+    flushWrites()   // make sure the last remote edits reach disk before we save
     ui.clear()
     try {
       if (othersAlive() > 0) {
@@ -540,6 +684,9 @@ async function connect() {
     ui.set(`live - ${n} peer${n === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}`)
   }, 2000)
 
+  // swap the startup-only exit handlers for the real ones
+  process.off('SIGINT', earlyExit)
+  process.off('SIGTERM', earlyExit)
   ui.say('Ready. Ctrl+C to leave.')
   process.on('SIGINT', () => { clearInterval(tick); leave() })
   process.on('SIGTERM', () => { clearInterval(tick); leave() })
