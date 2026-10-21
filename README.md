@@ -2,11 +2,11 @@
 
 > If things don't work, think of trying to look inside a coconut without breaking it. That's what CoCoCode is.
 
-CIII is a peer-to-peer tool for live collaborative coding. It syncs project files between teammates on Windows, Linux, and macOS.
+CIII is a peer-to-peer tool for live collaborative coding. It syncs project files between teammates on Linux, Windows, and macOS.
 
 Peers discover each other through a distributed hash table (DHT) and connect directly. There is no dedicated host or manual port forwarding. Connections are encrypted.
 
-Requires **Node.js 22 or newer**.
+Requires **Node.js 22 or newer**
 
 ## Quick start
 
@@ -18,8 +18,8 @@ git clone https://github.com/feztromo/ciii.git c3
 echo c3/ >> .gitignore
 cd c3
 npm install
-node c3.js config
-node c3.js connect
+node c3 config
+node c3 connect
 ```
 
 The configuration wizard lets you choose how sessions are archived and set a session name and key.
@@ -29,7 +29,7 @@ The configuration wizard lets you choose how sessions are archived and set a ses
 Share the session name and key with your teammates outside of CIII. They clone CIII into their project, install dependencies, and connect using the same details:
 
 ```bash
-node c3.js connect --name "my_project" --key <key>
+node c3 connect --name "my_project" --key <key>
 ```
 
 Peers using the same name and key join the same session. Once configured, `node c3.js connect` is enough.
@@ -38,10 +38,10 @@ Peers using the same name and key join the same session. Once configured, `node 
 
 | Command | Description |
 |---|---|
-| `node c3.js config` | Configure the session and archive backend |
-| `node c3.js connect` | Start or join a session |
-| `node c3.js export [dir]` | Export shareable files to a directory |
-| `node c3.js doctor` | Check configuration and DHT connectivity |
+| `node c3 config` | Configure the session and archive backend |
+| `node c3 connect` | Start or join a session |
+| `node c3 export [dir]` | Export shareable files to a directory |
+| `node c3 doctor` | Check configuration and DHT connectivity |
 
 ## Saving work
 
