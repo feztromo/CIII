@@ -1,13 +1,23 @@
 {
-  "name": "ciii",
-  "version": "0.7.0",
-  "type": "module",
+  "name": "c3",
   "private": true,
-  "bin": { "c3": "./c3.js" },
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "config": "node c3.js config",
+    "connect": "node c3.js connect",
+    "invite": "node c3.js invite",
+    "doctor": "node c3.js doctor"
+  },
   "dependencies": {
-    "chokidar": "^4.0.3",
-    "hyperswarm": "^4.8.0",
-    "ignore": "^6.0.0",
-    "yjs": "^13.6.21"
+    "yjs": "latest",
+    "libp2p": "latest",
+    "@libp2p/tcp": "latest",
+    "@chainsafe/libp2p-noise": "latest",
+    "@chainsafe/libp2p-yamux": "latest",
+    "@libp2p/identify": "latest",
+    "@chainsafe/libp2p-gossipsub": "latest",
+    "@libp2p/crypto": "latest",
+    "@multiformats/multiaddr": "latest"
   }
 }
