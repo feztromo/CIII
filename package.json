@@ -10,7 +10,7 @@
     "doctor": "node c3.js doctor"
   },
   "dependencies": {
-    "yjs": "latest",
+    "yjs": "^13.6.27",
     "libp2p": "latest",
     "@libp2p/tcp": "latest",
     "@chainsafe/libp2p-noise": "latest",
