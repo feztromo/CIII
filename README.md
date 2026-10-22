@@ -34,7 +34,7 @@ node c3.js invite
 Share the printed `c3://join/...` link with your teammate. They can join using:
 
 ```bash
-node c3.js join 'c3://join/...'
+node c3.js join "c3://join/..."
 ```
 
 After the first successful connection, peers cache each other's addresses. Future sessions can usually reconnect without an invite.
