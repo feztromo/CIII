@@ -22,6 +22,14 @@ const MAX_ADDR = 8
 const JOIN_WAIT = 15000
 const isMa = a => typeof a === 'string' && /^\/(ip4|ip6|dns)\//.test(a) && /\/tcp\/\d{1,5}\/p2p\/[^/]+$/.test(a)
 const dbg = (...a) => { if (process.env.C3_DEBUG) console.error(...a) }
+const topicOf = evt => {
+  const t = evt?.detail?.topic
+  return typeof t === 'string' ? t : t ? Buffer.from(t).toString() : ''
+}
+const dataOf = evt => {
+  const d = evt?.detail?.data
+  return d ? Buffer.from(d.subarray ? d.subarray() : d) : Buffer.alloc(0)
+}
 
 // ---------- keyed AEAD ----------
 const sealWith = (key, b) => {
@@ -99,7 +107,7 @@ export function addrsOf(n, advertise) {
   for (const a of n.getMultiaddrs()) {
     let s = a.toString()
     if (/\/ip4\/(0\.0\.0\.0|169\.254\.)/.test(s)) continue
-    if (/\/ip6\/(::|fe80)/.test(s)) continue
+    if (/\/ip6\/(::1|::|fe80)/.test(s)) continue
     if (!s.includes('/p2p/')) s += `/p2p/${n.peerId}`
     out.add(s)
   }
@@ -116,30 +124,42 @@ export function addrsOf(n, advertise) {
 export function joinResponder(n, getInvites, onRequest) {
   const active = new Map()
   const served = new Map()
+
   const refresh = () => {
     let list = []
     try { list = getInvites() } catch { return }
+    const now = Date.now()
     for (const inv of list) {
-      if (!inv?.tpc || !inv?.sk || active.has(inv.tpc)) continue
-      if (!(inv.exp > Date.now())) continue
+      if (!inv?.tpc || !inv?.sk) continue
+      if (!(inv.exp > now)) { active.delete(inv.tpc); continue }
+      if (active.has(inv.tpc)) continue
       active.set(inv.tpc, { sk: Buffer.from(inv.sk, 'base64'), entry: inv })
       try { Promise.resolve(n.services.pubsub.subscribe(inv.tpc)).catch(() => {}) } catch {}
+      dbg('[invite] listening on', inv.tpc)
     }
   }
+
   n.services.pubsub.addEventListener('message', evt => {
-    const a = active.get(evt.detail.topic)
+    const tpc = topicOf(evt)
+    const a = active.get(tpc)
     if (!a) return
     let req
-    try { req = JSON.parse(openWith(a.sk, Buffer.from(evt.detail.data)).toString('utf8')) } catch { return }
-    if (!req || typeof req.n !== 'string') return
-    let set = served.get(evt.detail.topic)
-    if (!set) { set = new Set(); served.set(evt.detail.topic, set) }
+    try { req = JSON.parse(openWith(a.sk, dataOf(evt)).toString('utf8')) } catch { return }
+    if (!req || typeof req.n !== 'string' || req.n.length > 64) return
+    dbg('[invite] request on', tpc)
+    let set = served.get(tpc)
+    if (!set) { set = new Set(); served.set(tpc, set) }
+    if (set.size > 256) set.clear()
     const res = onRequest(a.entry, req.n, set.has(req.n))
     if (!res) return
     set.add(req.n)
     const body = Buffer.from(JSON.stringify({ n: req.n, name: res.name, key: res.key }))
-    try { Promise.resolve(n.services.pubsub.publish(evt.detail.topic, sealWith(a.sk, body))).catch(() => {}) } catch {}
+    try {
+      Promise.resolve(n.services.pubsub.publish(tpc, sealWith(a.sk, body)))
+        .catch(e => dbg('[invite] reply', e?.message || e))
+    } catch (e) { dbg('[invite] reply threw', e?.message || e) }
   })
+
   refresh()
   const t = setInterval(refresh, 3000)
   t.unref?.()
@@ -150,27 +170,38 @@ export async function joinCall(n, invite, wait = JOIN_WAIT) {
   const sk = tokenKey(invite.t)
   const tpc = tokenTopic(invite.t)
   const nonce = crypto.randomBytes(8).toString('hex')
-  for (const a of invite.a) if (isMa(a)) { try { n.dial(multiaddr(a)).catch(() => {}) } catch {} }
-  try { await n.services.pubsub.subscribe(tpc) } catch {}
+
+  for (const a of invite.a) {
+    if (!isMa(a)) continue
+    try { n.dial(multiaddr(a)).catch(() => {}) } catch {}
+  }
+  try { Promise.resolve(n.services.pubsub.subscribe(tpc)).catch(() => {}) } catch {}
+  await new Promise(r => setTimeout(r, 500))
+
   let settle = () => {}
   const got = new Promise(r => { settle = r })
   const onMsg = evt => {
-    if (evt.detail.topic !== tpc) return
+    if (topicOf(evt) !== tpc) return
     let m
-    try { m = JSON.parse(openWith(sk, Buffer.from(evt.detail.data)).toString('utf8')) } catch { return }
+    try { m = JSON.parse(openWith(sk, dataOf(evt)).toString('utf8')) } catch { return }
     if (m?.n !== nonce || typeof m.name !== 'string' || typeof m.key !== 'string') return
     settle({ ok: 1, name: m.name, key: m.key })
   }
   n.services.pubsub.addEventListener('message', onMsg)
+
   const body = sealWith(sk, Buffer.from(JSON.stringify({ n: nonce })))
   const until = Date.now() + wait
   let out = null
   while (!out && Date.now() < until) {
-    try { n.services.pubsub.publish(tpc, body).catch(() => {}) } catch {}
+    try {
+      Promise.resolve(n.services.pubsub.publish(tpc, body))
+        .catch(e => dbg('[join] publish', e?.message || e))
+    } catch (e) { dbg('[join] publish threw', e?.message || e) }
     out = await Promise.race([got, new Promise(r => setTimeout(() => r(null), 1500))])
   }
+
   try { n.services.pubsub.removeEventListener('message', onMsg) } catch {}
-  try { await n.services.pubsub.unsubscribe(tpc) } catch {}
+  try { Promise.resolve(n.services.pubsub.unsubscribe(tpc)).catch(() => {}) } catch {}
   if (!out) dbg('[join] no reply on', tpc)
   return out
 }
@@ -181,7 +212,14 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
   const aes = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key), Buffer.from('c3salt'), Buffer.from('c3msg'), 32))
   const parts = new Map()
 
-  const pub = b => { try { Promise.resolve(n.services.pubsub.publish(topic, sealWith(aes, b))).catch(() => {}) } catch {} }
+  // publish -- NOT subscribe
+  const pub = b => {
+    try {
+      Promise.resolve(n.services.pubsub.publish(topic, sealWith(aes, b)))
+        .catch(e => dbg('[sync] publish', e?.message || e))
+    } catch (e) { dbg('[sync] publish threw', e?.message || e) }
+  }
+
   const sendVec = () => pub(Buffer.concat([Buffer.from([T_VEC]), Buffer.from(Y.encodeStateVector(doc))]))
   const sendAddr = () => pub(Buffer.concat([Buffer.from([T_ADDR]), Buffer.from(JSON.stringify(addrsOf(n, advertise)))]))
 
@@ -189,6 +227,7 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
     const data = Buffer.from(u)
     const id = crypto.createHash('sha1').update(data).digest().subarray(0, 8)
     const count = Math.max(1, Math.ceil(data.length / CHUNK))
+    dbg('[sync] send update', data.length, 'bytes in', count, 'chunk(s)')
     for (let i = 0; i < count; i++) {
       const h = Buffer.allocUnsafe(13)
       h[0] = T_CHUNK
@@ -202,9 +241,9 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
   try { Promise.resolve(n.services.pubsub.subscribe(topic)).catch(() => {}) } catch {}
 
   n.services.pubsub.addEventListener('message', evt => {
-    if (evt.detail.topic !== topic) return
+    if (topicOf(evt) !== topic) return
     let b
-    try { b = openWith(aes, Buffer.from(evt.detail.data)) } catch { return }
+    try { b = openWith(aes, dataOf(evt)) } catch { return }
     const t = b[0]
     if (t === T_VEC) {
       const diff = Y.encodeStateAsUpdate(doc, b.subarray(1))
@@ -222,6 +261,7 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
       e.got++
       if (e.got === e.count) {
         parts.delete(id)
+        dbg('[sync] recv update', Buffer.concat(e.buf).length, 'bytes')
         try { Y.applyUpdate(doc, Buffer.concat(e.buf), 'remote') } catch {}
       }
       if (parts.size > 256) parts.clear()
