@@ -199,7 +199,8 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
     }
   }
 
-  n.services.pubsub.subscribe(topic).catch?.(() => {})
+  try { Promise.resolve(n.services.pubsub.subscribe(topic)).catch(() => {}) } catch {}
+
   n.services.pubsub.addEventListener('message', evt => {
     if (evt.detail.topic !== topic) return
     let b
