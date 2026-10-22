@@ -8,7 +8,7 @@ Requires **Node.js 22 or newer**
 
 ## Quick Start
 
-Clone C3 into your project and install dependencies:
+Clone c3 into your project and install dependencies:
 
 ```bash
 git clone https://github.com/feztromo/c3.git c3
@@ -74,9 +74,9 @@ Advanced options can be configured in `c3/.c3/config.json`.
 
 Choose an archive backend during configuration:
 
-- **`git`** — Commit changes and push to `origin`.
-- **`folder`** — Save timestamped snapshots to a directory.
-- **`none`** — Disable automatic archiving; use `export` to save a copy.
+- **`git`** Commit changes and push to `origin`.
+- **`folder`** Save timestamped snapshots to a directory.
+- **`none`** Disable automatic archiving; use `export` to save a copy.
 
 Unsaved state can be restored when reconnecting. Keep `c3/` in your project's `.gitignore` to avoid committing C3's configuration and session state.
 
@@ -92,7 +92,7 @@ Unsaved state can be restored when reconnecting. Keep `c3/` in your project's `.
 
 At least one participant must have an inbound-reachable endpoint, such as:
 
-- A public IPv6 address with the C3 port allowed through the firewall.
+- A public IPv6 address with the c3 port allowed through the firewall.
 - An IPv4 port forward with a stable hostname.
 - Another reachable participant already in the session.
 
