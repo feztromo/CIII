@@ -396,7 +396,7 @@ async function connect(invite) {
   mkdirp(SESSION_DIR)
   const ident = await loadKey(path.join(SESSION_DIR, 'identity.key'))
   let name = null, sKey = null, sdir = null, cfg = cfg0
-  let port = Number(flag('port') ?? cfg0.port ?? DEFAULT_PORT)
+  let port = Number(flag('port') ?? (invite ? 0 : cfg0.port ?? DEFAULT_PORT))
   if (!Number.isInteger(port) || port < 1 || port > 65535) die('Bad port.')
   let advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
   if (advertise && !toMa(advertise, 'x')) die('--advertise must be host:port.')
@@ -409,7 +409,7 @@ async function connect(invite) {
   let leaving = false
   let peerTimer = null, snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null
   let started = false
-  const peerCount = () => { try { return n.services.pubsub.getPeers().length } catch { return n.getConnections().length } }
+  const peerCount = () => new Set(n.getConnections().map(c => c.remotePeer.toString())).size
   const connAddr = c => {
     let a = c.remoteAddr.toString()
     if (!a.includes('/p2p/')) a += `/p2p/${c.remotePeer.toString()}`

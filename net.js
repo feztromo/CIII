@@ -11,6 +11,7 @@ import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys'
 import { multiaddr } from '@multiformats/multiaddr'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import net from 'node:net'
 
 const AUTH = '/c3/auth/1'
 const T_ADDR = 0
@@ -18,32 +19,106 @@ const T_VEC = 1
 const T_CHUNK = 2
 const CHUNK = 32 * 1024
 const MAX_ADDR = 8
-const one = b => (async function* () { yield b })()
+const MAX_MSG = 8192
+const ONE = b => (async function* () { yield b })()
 const isMa = a => typeof a === 'string' && /^\/(ip4|ip6|dns)\//.test(a) && /\/tcp\/\d{1,5}\/p2p\/[^/]+$/.test(a)
+const dbg = (...a) => { if (process.env.C3_DEBUG) console.error(...a) }
 
+// ---------- stream helpers (tolerate old and new libp2p APIs) ----------
+async function readAll(stream, timeout = 8000) {
+  if (!stream) throw new Error('no stream')
+  const collect = async () => {
+    const chunks = []
+    let len = 0
+    if (stream.source) {
+      for await (const c of stream.source) {
+        len += c.length
+        if (len > MAX_MSG) throw new Error('too big')
+        chunks.push(Buffer.from(c.subarray()))
+      }
+      return Buffer.concat(chunks)
+    }
+    if (typeof stream.recv === 'function') {
+      const c = await stream.recv()
+      return c ? Buffer.from(c.subarray()) : Buffer.alloc(0)
+    }
+    throw new Error('unsupported stream')
+  }
+  return Promise.race([
+    collect(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('read timeout')), timeout))
+  ])
+}
+
+async function writeAll(stream, buf) {
+  if (!stream) throw new Error('no stream')
+  if (stream.sink) {
+    await stream.sink(ONE(buf))
+    try { await stream.closeWrite?.() } catch {}
+    return
+  }
+  if (typeof stream.send === 'function') {
+    await stream.send(buf)
+    try { await stream.close?.() } catch {}
+    return
+  }
+  throw new Error('unsupported stream')
+}
+
+async function closeStream(stream) {
+  try {
+    if (typeof stream?.close === 'function') await stream.close()
+    else stream?.abort?.()
+  } catch {}
+}
+
+const streamOf = r => r?.stream ?? r
+
+function freePort() {
+  return new Promise((res, rej) => {
+    const s = net.createServer()
+    s.once('error', rej)
+    s.listen(0, '0.0.0.0', () => { const p = s.address().port; s.close(() => res(p)) })
+  })
+}
+
+// ---------- identity ----------
 export async function loadKey(file) {
   try {
     return await privateKeyFromRaw(Buffer.from(fs.readFileSync(file, 'utf8').trim(), 'base64'))
   } catch {
-    const { privateKey } = await generateKeyPair('Ed25519')
-    fs.writeFileSync(file, Buffer.from(privateKey.raw).toString('base64'), { mode: 0o600 })
-    return privateKey
+    const key = await generateKeyPair('Ed25519')
+    fs.writeFileSync(file, Buffer.from(key.raw).toString('base64'), { mode: 0o600 })
+    return key
   }
 }
 
+// ---------- node ----------
 export async function makeNode(key, port) {
-  const n = await createLibp2p({
+  const build = p => createLibp2p({
     privateKey: key,
-    addresses: { listen: [`/ip4/0.0.0.0/tcp/${port}`] },
+    addresses: { listen: [`/ip4/0.0.0.0/tcp/${p}`] },
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     services: { identify: identify(), pubsub: gossipsub() }
   })
-  try { await n.listen(`/ip6/::/tcp/${port}`) } catch {}
+  const want = Number(port)
+  let p = Number.isInteger(want) && want > 0 ? want : await freePort()
+  let n
+  try {
+    n = await build(p)
+  } catch (e) {
+    dbg('[listen]', p, e?.message || e)
+    const alt = await freePort()
+    console.error(`! warning port ${p} unavailable -- listening on ${alt}`)
+    n = await build(alt)
+  }
+  try { await n.listen(`/ip6/::/tcp/${p}`) } catch {}
   return n
 }
 
+// ---------- addressing ----------
 export function toMa(hp, id) {
   const s = String(hp || '').trim()
   const m = s.match(/^\[([^\]]+)\]:(\d+)$/) || s.match(/^([^:]+):(\d+)$/)
@@ -60,8 +135,8 @@ export function addrsOf(n, advertise) {
   const out = new Set()
   for (const a of n.getMultiaddrs()) {
     let s = a.toString()
-    if (/\/ip4\/(127\.|0\.0\.0\.0|169\.254\.)/.test(s)) continue
-    if (/\/ip6\/(::1|::)\//.test(s) || /\/ip6\/fe80/.test(s)) continue
+    if (/\/ip4\/(0\.0\.0\.0|169\.254\.)/.test(s)) continue
+    if (/\/ip6\/(::|fe80)/.test(s)) continue
     if (!s.includes('/p2p/')) s += `/p2p/${n.peerId}`
     out.add(s)
   }
@@ -72,23 +147,22 @@ export function addrsOf(n, advertise) {
   return [...out]
 }
 
+// ---------- token auth over a libp2p stream ----------
 export function authServer(n, handler) {
-  n.handle(AUTH, async ({ stream, connection }) => {
+  const handle = async (first, second) => {
+    const stream = first?.stream ?? first
+    const connection = first?.connection ?? second
     let out = Buffer.from(JSON.stringify({ ok: 0 }))
     try {
-      const chunks = []
-      let len = 0
-      for await (const c of stream.source) {
-        len += c.length
-        if (len > 8192) throw new Error('too big')
-        chunks.push(Buffer.from(c.subarray()))
-      }
-      const req = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-      const res = await handler(req, connection.remotePeer.toString())
+      const req = JSON.parse((await readAll(stream)).toString('utf8'))
+      const peer = connection?.remotePeer?.toString?.() ?? ''
+      const res = await handler(req, peer)
       if (res) out = Buffer.from(JSON.stringify(res))
-    } catch {}
-    try { await stream.sink(one(out)) } catch {}
-  })
+    } catch (e) { dbg('[auth-server]', e?.message || e) }
+    try { await writeAll(stream, out) } catch (e) { dbg('[auth-server-write]', e?.message || e) }
+    await closeStream(stream)
+  }
+  n.handle(AUTH, handle)
 }
 
 export async function authCall(n, addrs, req) {
@@ -97,26 +171,23 @@ export async function authCall(n, addrs, req) {
     if (!isMa(a)) continue
     let stream = null
     try {
-      stream = await Promise.race([
+      const r = await Promise.race([
         n.dialProtocol(multiaddr(a), AUTH),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
+        new Promise((_, rej) => setTimeout(() => rej(new Error('dial timeout')), 8000))
       ])
-      await stream.sink(one(body))
-      const chunks = []
-      let len = 0
-      for await (const c of stream.source) {
-        len += c.length
-        if (len > 8192) throw new Error('too big')
-        chunks.push(Buffer.from(c.subarray()))
-      }
-      const res = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      stream = streamOf(r)
+      await writeAll(stream, body)
+      const res = JSON.parse((await readAll(stream)).toString('utf8'))
       if (res?.ok) return res
-    } catch {}
-    finally { try { stream?.abort?.() } catch {} }
+      dbg('[auth] rejected:', a, JSON.stringify(res))
+    } catch (e) {
+      dbg('[auth]', a, e?.message || e)
+    } finally { await closeStream(stream) }
   }
   return null
 }
 
+// ---------- encrypted gossip sync ----------
 export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
   const topic = crypto.createHash('sha256').update('c3topic\0' + name + '\0' + key).digest('hex')
   const aes = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key), Buffer.from('c3salt'), Buffer.from('c3msg'), 32))
@@ -129,6 +200,7 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
     return Buffer.concat([iv, ct, c.getAuthTag()])
   }
   const open = b => {
+    if (b.length < 12 + 16) throw new Error('short')
     const d = crypto.createDecipheriv('aes-256-gcm', aes, b.subarray(0, 12))
     d.setAuthTag(b.subarray(b.length - 16))
     return Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()])
@@ -187,6 +259,8 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
     if (origin !== 'remote' && origin !== 'restore') sendUpd(u)
   })
   n.addEventListener('peer:connect', () => { sendVec(); sendAddr() })
+  const timer = setInterval(() => { sendVec(); sendAddr() }, 8000)
+  if (timer.unref) timer.unref()
   sendVec()
   sendAddr()
   return { topic, sendVec, sendAddr }
