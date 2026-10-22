@@ -46,6 +46,7 @@ const openWith = (key, b) => {
 }
 export const tokenKey = tok => crypto.createHash('sha256').update('c3tok\0' + tok).digest()
 export const tokenTopic = tok => 'c3join/' + crypto.createHash('sha256').update('c3join\0' + tok).digest('hex')
+export const syncTopic = (name, key) => crypto.createHash('sha256').update('c3topic\0' + name + '\0' + key).digest('hex')
 
 // ---------- identity ----------
 export async function loadKey(file) {
@@ -74,7 +75,10 @@ export async function makeNode(key, port) {
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    services: { identify: identify(), pubsub: gossipsub() }
+    services: {
+      identify: identify(),
+      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true })
+    }
   })
   let n
   try {
@@ -86,6 +90,7 @@ export async function makeNode(key, port) {
     n = await build(alt)
   }
   try { await n.listen(`/ip6/::/tcp/${p}`) } catch {}
+  dbg('[node] peer', n.peerId.toString(), 'port', p)
   return n
 }
 
@@ -119,8 +124,6 @@ export function addrsOf(n, advertise) {
 }
 
 // ---------- token join (host side) ----------
-// getInvites() -> [{ tpc, sk(base64), exp, uses, used }]
-// onRequest(entry, nonce, replay) -> { name, key } | null
 export function joinResponder(n, getInvites, onRequest) {
   const active = new Map()
   const served = new Map()
@@ -176,6 +179,7 @@ export async function joinCall(n, invite, wait = JOIN_WAIT) {
     try { n.dial(multiaddr(a)).catch(() => {}) } catch {}
   }
   try { Promise.resolve(n.services.pubsub.subscribe(tpc)).catch(() => {}) } catch {}
+  dbg('[join] listening on', tpc)
   await new Promise(r => setTimeout(r, 500))
 
   let settle = () => {}
@@ -208,9 +212,11 @@ export async function joinCall(n, invite, wait = JOIN_WAIT) {
 
 // ---------- encrypted gossip sync ----------
 export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
-  const topic = crypto.createHash('sha256').update('c3topic\0' + name + '\0' + key).digest('hex')
+  const topic = syncTopic(name, key)
   const aes = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key), Buffer.from('c3salt'), Buffer.from('c3msg'), 32))
   const parts = new Map()
+  dbg('[sync] topic', topic)
+  dbg('[sync] peer', n.peerId.toString())
 
   // publish -- NOT subscribe
   const pub = b => {
@@ -239,6 +245,15 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
   }
 
   try { Promise.resolve(n.services.pubsub.subscribe(topic)).catch(() => {}) } catch {}
+
+  const reportMesh = () => {
+    try {
+      const subs = n.services.pubsub.getSubscribers(topic) || []
+      dbg('[sync] subscribers', subs.length)
+    } catch {}
+  }
+  const meshTimer = setInterval(reportMesh, 10000)
+  meshTimer.unref?.()
 
   n.services.pubsub.addEventListener('message', evt => {
     if (topicOf(evt) !== topic) return
