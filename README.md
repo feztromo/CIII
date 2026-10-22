@@ -2,108 +2,109 @@
 
 > If things don't work, think of trying to look inside a coconut without breaking it. That's what CoCoCode is.
 
-CIII is a peer-to-peer tool for live collaborative coding. It syncs project files between teammates on Linux, Windows, and macOS.
-
-Peers discover each other through a distributed hash table (DHT) and connect directly. There is no dedicated host or manual port forwarding. Connections are encrypted.
+This project is a peer-to-peer tool for live collaborative coding. It synchronizes project files between cross-platform teammates over encrypted connections, without a central server.
 
 Requires **Node.js 22 or newer**
 
-## Quick start
+## Quick Start
 
-Clone CIII into your project, then install and configure it:
+Clone C3 into your project and install dependencies:
 
 ```bash
-cd my-project
-git clone https://github.com/feztromo/ciii.git c3
+git clone https://github.com/feztromo/c3.git c3
 echo c3/ >> .gitignore
-cd c3
-npm install
-node c3 config
-node c3 connect
+cd c3 && npm install
+node c3.js config
 ```
 
-The configuration wizard lets you choose how sessions are archived and set a session name and key.
-
-## Invite others
-
-Share the session name and key with your teammates outside of CIII. They clone CIII into their project, install dependencies, and connect using the same details:
+Start or join a session:
 
 ```bash
-node c3 connect --name "my_project" --key <key>
+node c3.js connect
 ```
 
-Peers using the same name and key join the same session. Once configured, `node c3.js connect` is enough.
+## Invite Others
+
+Start a session, then generate a single-use invite:
+
+```bash
+node c3.js invite
+```
+
+Share the printed `c3://join/...` link with your teammate. They can join using:
+
+```bash
+node c3.js join 'c3://join/...'
+```
+
+After the first successful connection, peers cache each other's addresses. Future sessions can usually reconnect without an invite.
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `node c3 config` | Configure the session and archive backend |
-| `node c3 connect` | Start or join a session |
-| `node c3 export [dir]` | Export shareable files to a directory |
-| `node c3 doctor` | Check configuration and DHT connectivity |
-
-## Saving work
-
-Choose an archive backend during configuration.
-
-| Backend | Behaviour |
-|---|---|
-| `git` | Commits changes and pushes to `origin` |
-| `folder` | Saves timestamped snapshots to a directory |
-| `none` | Does not archive automatically. Use `export` to keep a copy |
-
-When the last peer leaves, CIII asks whether to publish the session. If others are still connected, the current state is kept locally instead. Unsaved state can be restored when reconnecting.
+| `node c3.js config` | Configure the session and archive backend |
+| `node c3.js connect` | Start or join a session |
+| `node c3.js invite` | Generate a single-use invite |
+| `node c3.js join <url>` | Join using an invite link |
+| `node c3.js export <dir>` | Export shared files |
+| `node c3.js doctor` | Check configuration and connectivity |
 
 ## Configuration
 
+Configure the session name, key, port, and optional reachable endpoint.
+
 | Option | Description |
 |---|---|
-| `C3_KEY` | Provide the session key through an environment variable |
-| `--name <name>` | Set the session name when connecting |
-| `--key <key>` | Set the session key when connecting |
+| `C3_KEY` | Set the session key via environment variable |
+| `--name <name>` | Set the session name |
+| `--key <key>` | Set the session key |
+| `--port <n>` | Set the listening TCP port (default: `8443`) |
+| `--advertise <host:port>` | Specify the reachable endpoint |
+| `--peer <multiaddr>` | Add a peer address |
+| `--seed` | Publish this directory into an empty session |
+| `--ttl <hours>` | Set invite lifetime (default: `24`) |
+| `--uses <n>` | Set invite use count (default: `1`) |
 | `--yes` | Confirm publishing without prompting |
-| `--archive <type>` | Select `git`, `folder:<path>`, or `none` during configuration |
+| `--archive <type>` | Select `git`, `folder:<path>`, or `none` |
 
-Advanced options can be set in `c3/.c3/config.json`. For example, `verify` runs a command before publishing:
+Advanced options can be configured in `c3/.c3/config.json`.
 
-```json
-{
-  "verify": "npm test"
-}
-```
+## Saving Work
 
-## How it works
+Choose an archive backend during configuration:
 
-- **Discovery:** Hyperswarm uses a distributed hash table to find peers with the same session name and key.
-- **Sync:** Yjs keeps file changes in sync between connected peers.
-- **Networking:** Hyperswarm establishes direct peer-to-peer connections across networks without manual port forwarding.
-- **Encryption:** Peer connections are encrypted. The session name and key determine the room peers join.
-- **File safety:** CIII rejects unsafe paths, symlink escapes, and files larger than 16 MiB. Common generated folders and sensitive file patterns are ignored by default.
+- **`git`** — Commit changes and push to `origin`.
+- **`folder`** — Save timestamped snapshots to a directory.
+- **`none`** — Disable automatic archiving; use `export` to save a copy.
 
-## File layout
+Unsaved state can be restored when reconnecting. Keep `c3/` in your project's `.gitignore` to avoid committing C3's configuration and session state.
 
-```text
-my-project/
-├── .git/
-├── src/
-└── c3/                 # cloned repository
-    ├── c3.js
-    ├── package.json
-    └── .c3/             # created during setup
-        ├── config.json
-        ├── id
-        └── <hash>/
-            ├── key
-            ├── state.bin
-            └── state.gen
-```
+## How It Works
 
-Keep `c3/` in your project's `.gitignore`. Configuration and session state live in `c3/.c3/` and should not be committed to your project repository.
+- **Discovery:** Invites and cached peer addresses, shared over authenticated connections.
+- **Sync:** Yjs synchronizes file changes between connected peers.
+- **Networking:** TCP connections using libp2p; reachable peers accept connections and help outbound-only peers join.
+- **Encryption:** Noise secures transport; AES-256-GCM encrypts session payloads.
+- **File safety:** Rejects unsafe paths, symlink escapes, and files larger than 16 MiB.
+
+## Reachability
+
+At least one participant must have an inbound-reachable endpoint, such as:
+
+- A public IPv6 address with the C3 port allowed through the firewall.
+- An IPv4 port forward with a stable hostname.
+- Another reachable participant already in the session.
+
+Outbound-only peers can connect through a reachable participant. If every peer is behind inbound-blocking NAT, cross-network connections cannot be established until a reachable peer returns.
+
+Direct peer-to-peer connections may reveal IP addresses to connected peers. Use a participant-owned relay or VPN if IP privacy is important.
 
 ## Troubleshooting
 
-- Run `node c3.js doctor` to check the setup.
-- Make sure every peer uses the same session name and key.
-- Check that `npm install` completed and that Node.js 22 or newer is installed.
-- If the DHT cannot be reached, check whether your network or firewall blocks outbound UDP.
+- **Check setup:** Run `node c3.js doctor`.
+- **Session mismatch:** Ensure all peers use the same session name and key.
+- **Installation:** Verify `npm install` completed and Node.js 22 or newer is installed.
+- **Invite issues:** Start `node c3.js connect` on a reachable peer before running `node c3.js invite`.
+- **Port conflicts:** Specify another port with `--port`.
+- **Connection issues:** Check the advertised endpoint, firewall rules, and ensure at least one peer has a reachable address.
