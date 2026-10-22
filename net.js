@@ -1,105 +1,45 @@
-// net.js -- libp2p transport, token join, encrypted gossip for c3.
-// Join rides on gossipsub, so there is no custom stream protocol to break
-// across libp2p majors. No DHT. No public relay. No third-party discovery.
-import * as Y from 'yjs'
-import { createLibp2p } from 'libp2p'
-import { tcp } from '@libp2p/tcp'
-import { noise } from '@chainsafe/libp2p-noise'
-import { yamux } from '@chainsafe/libp2p-yamux'
-import { identify } from '@libp2p/identify'
-import { gossipsub } from '@chainsafe/libp2p-gossipsub'
-import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys'
-import { multiaddr } from '@multiformats/multiaddr'
+// net.js -- plain-TCP transport for c3.
+// No libp2p, no DHT, no relays, no third-party discovery.
+// Frame: [u32 length][u8 type][payload]. JOIN/JOINOK carry a P-256
+// handshake; everything else is AES-256-GCM with the session key.
 import crypto from 'node:crypto'
-import fs from 'node:fs'
 import net from 'node:net'
+import os from 'node:os'
+import fs from 'node:fs'
+import * as Y from 'yjs'
 
-const T_ADDR = 0
-const T_VEC = 1
-const T_CHUNK = 2
+const T_JOIN = 1
+const T_JOINOK = 2
+const T_HELLO = 3
+const T_VECTOR = 4
+const T_UPDATE = 5
+const T_ADDRS = 6
+const MAX_FRAME = 64 << 20
 const CHUNK = 32 * 1024
 const MAX_ADDR = 8
-const JOIN_WAIT = 15000
-const isMa = a => typeof a === 'string' && /^\/(ip4|ip6|dns)\//.test(a) && /\/tcp\/\d{1,5}\/p2p\/[^/]+$/.test(a)
 const dbg = (...a) => { if (process.env.C3_DEBUG) console.error(...a) }
-const topicOf = evt => {
-  const t = evt?.detail?.topic
-  return typeof t === 'string' ? t : t ? Buffer.from(t).toString() : ''
-}
-const dataOf = evt => {
-  const d = evt?.detail?.data
-  return d ? Buffer.from(d.subarray ? d.subarray() : d) : Buffer.alloc(0)
-}
+const sha = b => crypto.createHash('sha256').update(b).digest()
 
-// ---------- keyed AEAD ----------
-const sealWith = (key, b) => {
-  const iv = crypto.randomBytes(12)
-  const c = crypto.createCipheriv('aes-256-gcm', key, iv)
-  const ct = Buffer.concat([c.update(b), c.final()])
-  return Buffer.concat([iv, ct, c.getAuthTag()])
-}
-const openWith = (key, b) => {
-  if (b.length < 29) throw new Error('short')
-  const d = crypto.createDecipheriv('aes-256-gcm', key, b.subarray(0, 12))
-  d.setAuthTag(b.subarray(b.length - 16))
-  return Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()])
-}
-export const tokenKey = tok => crypto.createHash('sha256').update('c3tok\0' + tok).digest()
-export const tokenTopic = tok => 'c3join/' + crypto.createHash('sha256').update('c3join\0' + tok).digest('hex')
-export const syncTopic = (name, key) => crypto.createHash('sha256').update('c3topic\0' + name + '\0' + key).digest('hex')
+export const tokenTopic = tok => 'c3tok/' + sha(String(tok)).toString('hex')
+export const tokenKey = tok => sha('c3tokkey\0' + String(tok))
 
 // ---------- identity ----------
 export async function loadKey(file) {
   try {
-    return await privateKeyFromRaw(Buffer.from(fs.readFileSync(file, 'utf8').trim(), 'base64'))
-  } catch {
-    const key = await generateKeyPair('Ed25519')
-    fs.writeFileSync(file, Buffer.from(key.raw).toString('base64'), { mode: 0o600 })
-    return key
-  }
-}
-
-// ---------- node ----------
-const freePort = () => new Promise((res, rej) => {
-  const s = net.createServer()
-  s.once('error', rej)
-  s.listen(0, '0.0.0.0', () => { const p = s.address().port; s.close(() => res(p)) })
-})
-
-export async function makeNode(key, port) {
-  const want = Number(port)
-  const p = Number.isInteger(want) && want > 0 ? want : await freePort()
-  const build = q => createLibp2p({
-    privateKey: key,
-    addresses: { listen: [`/ip4/0.0.0.0/tcp/${q}`] },
-    transports: [tcp()],
-    connectionEncrypters: [noise()],
-    streamMuxers: [yamux()],
-    services: {
-      identify: identify(),
-      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true })
-    }
-  })
-  let n
-  try {
-    n = await build(p)
-  } catch (e) {
-    dbg('[listen]', p, e?.message || e)
-    const alt = await freePort()
-    console.error(`! warning port ${p} unavailable -- listening on ${alt}`)
-    n = await build(alt)
-  }
-  try { await n.listen(`/ip6/::/tcp/${p}`) } catch {}
-  dbg('[node] peer', n.peerId.toString(), 'port', p)
-  return n
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (j && typeof j.id === 'string' && /^[0-9a-f]{16}$/.test(j.id)) return j
+  } catch {}
+  const ident = { id: crypto.randomBytes(8).toString('hex') }
+  try { fs.writeFileSync(file, JSON.stringify(ident), { mode: 0o600 }) } catch {}
+  return ident
 }
 
 // ---------- addressing ----------
 export function toMa(hp, id) {
   const s = String(hp || '').trim()
-  const m = s.match(/^\[([^\]]+)\]:(\d+)$/) || s.match(/^([^:]+):(\d+)$/)
+  const m = s.match(/^\[([^\]]+)\]:(\d+)$/) || s.match(/^([^:]+)(?::(\d+))?$/)
   if (!m) return null
-  const port = Number(m[2])
+  const port = Number(m[2] || 8443)
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null
   const host = m[1]
   const base = host.includes(':') ? `/ip6/${host}`
@@ -107,193 +47,419 @@ export function toMa(hp, id) {
   return `${base}/tcp/${port}/p2p/${id}`
 }
 
-export function addrsOf(n, advertise) {
-  const out = new Set()
-  for (const a of n.getMultiaddrs()) {
-    let s = a.toString()
-    if (/\/ip4\/(0\.0\.0\.0|169\.254\.)/.test(s)) continue
-    if (/\/ip6\/(::1|::|fe80)/.test(s)) continue
-    if (!s.includes('/p2p/')) s += `/p2p/${n.peerId}`
-    out.add(s)
-  }
-  if (advertise) {
-    const m = toMa(advertise, n.peerId)
-    if (m) out.add(m)
-  }
-  return [...out]
+const hpOf = ma => {
+  const s = String(ma || '')
+  let m = s.match(/^\/ip4\/([^/]+)\/tcp\/(\d+)/) || s.match(/^\/dns\/([^/]+)\/tcp\/(\d+)/)
+  if (m) return { host: m[1], port: Number(m[2]) }
+  m = s.match(/^\/ip6\/([^/]+)\/tcp\/(\d+)/)
+  if (m) return { host: m[1], port: Number(m[2]) }
+  return null
 }
 
-// ---------- token join (host side) ----------
-export function joinResponder(n, getInvites, onRequest) {
-  const active = new Map()
-  const served = new Map()
+const usableV4 = a => !a.startsWith('169.254.') && !a.startsWith('0.')
 
-  const refresh = () => {
-    let list = []
-    try { list = getInvites() } catch { return }
-    const now = Date.now()
-    for (const inv of list) {
-      if (!inv?.tpc || !inv?.sk) continue
-      if (!(inv.exp > now)) { active.delete(inv.tpc); continue }
-      if (active.has(inv.tpc)) continue
-      active.set(inv.tpc, { sk: Buffer.from(inv.sk, 'base64'), entry: inv })
-      try { Promise.resolve(n.services.pubsub.subscribe(inv.tpc)).catch(() => {}) } catch {}
-      dbg('[invite] listening on', inv.tpc)
+export function addrsOf(n, advertise) { return n.addrsList(advertise) }
+
+// ---------- framing ----------
+const frame = (type, payload) => {
+  const p = payload && payload.length ? Buffer.from(payload) : Buffer.alloc(0)
+  const h = Buffer.allocUnsafe(5)
+  h.writeUInt32BE(p.length + 1, 0)
+  h[4] = type
+  return Buffer.concat([h, p])
+}
+
+const seal = (key, type, payload) => {
+  const iv = crypto.randomBytes(12)
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv)
+  c.setAAD(Buffer.from([type]))
+  const ct = Buffer.concat([c.update(payload || Buffer.alloc(0)), c.final()])
+  return frame(type, Buffer.concat([iv, ct, c.getAuthTag()]))
+}
+
+const unseal = (key, type, body) => {
+  if (!body || body.length < 28) throw new Error('short frame')
+  const d = crypto.createDecipheriv('aes-256-gcm', key, body.subarray(0, 12))
+  d.setAAD(Buffer.from([type]))
+  d.setAuthTag(body.subarray(body.length - 16))
+  return Buffer.concat([d.update(body.subarray(12, body.length - 16)), d.final()])
+}
+
+const freePort = () => new Promise((res, rej) => {
+  const s = net.createServer()
+  s.once('error', rej)
+  s.listen(0, '0.0.0.0', () => { const p = s.address().port; s.close(() => res(p)) })
+})
+
+// P-256: Node's createECDH supports this; x25519 is not a createECDH curve.
+const ecdh = () => {
+  const e = crypto.createECDH('prime256v1')
+  e.generateKeys()
+  return e
+}
+
+// ---------- mesh ----------
+class Mesh {
+  constructor(ident, port) {
+    this.ident = ident
+    this.id = ident.id
+    this.peerId = { toString: () => this.id }
+    this.wantPort = Number(port) > 0 ? Number(port) : 0
+    this.port = this.wantPort
+    this.conns = new Set()
+    this.events = new Map()
+    this.session = null
+    this.join = null
+    this.advertise = ''
+    this.stopped = false
+  }
+
+  on(type, fn) {
+    if (!this.events.has(type)) this.events.set(type, new Set())
+    this.events.get(type).add(fn)
+    return () => this.events.get(type)?.delete(fn)
+  }
+  addEventListener(type, fn) { this.on(type, fn) }
+  removeEventListener(type, fn) { this.events.get(type)?.delete(fn) }
+  // handlers always receive { detail }
+  emit(type, detail) {
+    for (const fn of this.events.get(type) || []) {
+      try { fn({ detail }) } catch (e) { dbg('[net] handler', e?.message || e) }
     }
   }
 
-  n.services.pubsub.addEventListener('message', evt => {
-    const tpc = topicOf(evt)
-    const a = active.get(tpc)
-    if (!a) return
+  addrsList(advertise) {
+    const out = new Set()
+    const port = this.port || this.wantPort
+    if (!port) return []
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const i of list || []) {
+        if (i.family !== 'IPv4' || i.internal) continue
+        if (!usableV4(i.address)) continue
+        const ma = toMa(`${i.address}:${port}`, this.id)
+        if (ma) out.add(ma)
+      }
+    }
+    const lo = toMa(`127.0.0.1:${port}`, this.id)
+    if (lo) out.add(lo)
+    const ad = advertise || this.advertise
+    if (ad) {
+      const ma = toMa(ad, this.id)
+      if (ma) out.add(ma)
+    }
+    return [...out].slice(0, MAX_ADDR + 2)
+  }
+
+  getMultiaddrs() { return this.addrsList(this.advertise).map(a => ({ toString: () => a })) }
+  getConnections() {
+    return [...this.conns].filter(c => c.ready).map(c => ({ remotePeer: { toString: () => c.peerId || '?' } }))
+  }
+
+  async start() {
+    this.server = net.createServer(sock => this.attach(sock, null))
+    const listen = p => new Promise((res, rej) => {
+      const onErr = e => { this.server.off('error', onErr); rej(e) }
+      this.server.once('error', onErr)
+      this.server.listen(p, () => { this.server.off('error', onErr); res() })
+    })
+    try { await listen(this.wantPort) } catch {
+      const alt = await freePort()
+      console.error(`! warning port ${this.wantPort} unavailable -- listening on ${alt}`)
+      await listen(alt)
+    }
+    this.port = this.server.address().port
+    this.server.on('error', () => {})
+    dbg('[net] listening on', this.port, 'id', this.id)
+  }
+
+  async stop() {
+    this.stopped = true
+    try { this.server?.close() } catch {}
+    for (const c of this.conns) { try { c.sock.destroy() } catch {} }
+    this.conns.clear()
+  }
+
+  dial(ma) {
+    try {
+      const hp = hpOf(ma)
+      if (!hp || this.stopped) return Promise.resolve(false)
+      if (hp.port === this.port) return Promise.resolve(false)
+      for (const c of this.conns) {
+        if (c.hp && c.hp.host === hp.host && c.hp.port === hp.port) return Promise.resolve(true)
+      }
+      return new Promise(res => {
+        const sock = net.connect({ host: hp.host, port: hp.port })
+        sock.setTimeout(6000, () => { try { sock.destroy() } catch {} })
+        sock.once('connect', () => { sock.setTimeout(0); this.attach(sock, hp); res(true) })
+        sock.once('error', () => { try { sock.destroy() } catch {}; res(false) })
+      })
+    } catch { return Promise.resolve(false) }
+  }
+
+  attach(sock, hp) {
+    if (this.stopped) { try { sock.destroy() } catch {}; return }
+    const conn = { sock, hp, peerId: null, ready: false, buf: Buffer.alloc(0) }
+    this.conns.add(conn)
+    sock.setNoDelay(true)
+    sock.setKeepAlive(true, 10000)
+    sock.on('data', d => this.onData(conn, d))
+    sock.on('error', () => {})
+    sock.on('close', () => {
+      this.conns.delete(conn)
+      if (conn.ready) this.emit('peer:disconnect', { toString: () => conn.peerId })
+    })
+    if (this.session) this.sendHello(conn)
+  }
+
+  onData(conn, d) {
+    conn.buf = conn.buf.length ? Buffer.concat([conn.buf, d]) : d
+    for (;;) {
+      if (conn.buf.length < 4) return
+      const len = conn.buf.readUInt32BE(0)
+      if (len < 1 || len > MAX_FRAME) { try { conn.sock.destroy() } catch {}; return }
+      if (conn.buf.length < 4 + len) return
+      const body = conn.buf.subarray(4, 4 + len)
+      conn.buf = conn.buf.subarray(4 + len)
+      try { this.onFrame(conn, body[0], body.subarray(1)) } catch (e) {
+        dbg('[net] frame', e?.message || e)
+        try { conn.sock.destroy() } catch {}
+        return
+      }
+    }
+  }
+
+  onFrame(conn, type, payload) {
+    if (type === T_JOIN) return this.onJoin(conn, payload)
+    if (!this.session) { try { conn.sock.destroy() } catch {}; return }
+    const plain = unseal(this.session.aes, type, payload)
+    if (type === T_HELLO) {
+      let m
+      try { m = JSON.parse(plain.toString('utf8')) } catch { return }
+      if (!m || typeof m.id !== 'string') return
+      if (m.id === this.id) { try { conn.sock.destroy() } catch {}; return }
+      if (conn.peerId && conn.peerId !== m.id) return
+      conn.peerId = m.id
+      // one live connection per peer: keep the first, drop the duplicate
+      for (const other of this.conns) {
+        if (other !== conn && other.ready && other.peerId === m.id) {
+          try { conn.sock.destroy() } catch {}
+          return
+        }
+      }
+      if (!conn.ready) {
+        conn.ready = true
+        dbg('[net] peer', m.id, 'on', conn.hp ? `${conn.hp.host}:${conn.hp.port}` : 'inbound')
+        this.emit('peer:connect', { toString: () => m.id })
+      }
+      if (Array.isArray(m.addrs)) {
+        const list = m.addrs.filter(a => typeof a === 'string' && /\/p2p\//.test(a)).slice(0, MAX_ADDR)
+        if (list.length) this.emit('addrs', list)
+      }
+      return
+    }
+    this.emit('message', { conn, type, payload: plain })
+  }
+
+  // writes bytes as-is: callers pass an already framed or already sealed buffer
+  sendBytes(conn, buf) {
+    if (!conn || conn.sock.destroyed || !buf) return
+    try { conn.sock.write(buf) } catch {}
+  }
+  sendSealed(conn, type, payload) {
+    if (!this.session) return
+    this.sendBytes(conn, seal(this.session.aes, type, payload))
+  }
+  sendAll(type, payload, except) {
+    for (const c of this.conns) if (c !== except && c.ready) this.sendSealed(c, type, payload)
+  }
+  sendHello(conn) {
+    if (!this.session) return
+    const body = Buffer.from(JSON.stringify({ id: this.id, name: this.session.name, addrs: this.addrsList(this.advertise), port: this.port }))
+    this.sendSealed(conn, T_HELLO, body)
+  }
+
+  onJoin(conn, payload) {
+    if (!this.join) { try { conn.sock.destroy() } catch {}; return }
     let req
-    try { req = JSON.parse(openWith(a.sk, dataOf(evt)).toString('utf8')) } catch { return }
-    if (!req || typeof req.n !== 'string' || req.n.length > 64) return
-    dbg('[invite] request on', tpc)
-    let set = served.get(tpc)
-    if (!set) { set = new Set(); served.set(tpc, set) }
-    if (set.size > 256) set.clear()
-    const res = onRequest(a.entry, req.n, set.has(req.n))
-    if (!res) return
-    set.add(req.n)
-    const body = Buffer.from(JSON.stringify({ n: req.n, name: res.name, key: res.key }))
+    try { req = JSON.parse(payload.toString('utf8')) } catch { return }
+    const { p, h } = req || {}
+    if (typeof p !== 'string' || typeof h !== 'string' || !/^[0-9a-f]{64}$/.test(h)) {
+      try { conn.sock.destroy() } catch {}
+      return
+    }
+    let list = []
+    try { list = this.join.getInvites() } catch {}
+    const entry = list.find(x => x && x.tpc === 'c3tok/' + h)
+    if (!entry) { dbg('[net] no invite for', h.slice(0, 12)); try { conn.sock.destroy() } catch {}; return }
+    const replay = this.join.seen.has(h)
+    const res = this.join.onRequest(entry, h, replay)
+    if (!res) { try { conn.sock.destroy() } catch {}; return }
+    this.join.seen.add(h)
+    const cpub = Buffer.from(p, 'base64')
+    const eph = ecdh()
+    const shared = eph.computeSecret(cpub)
+    const salt = sha(Buffer.concat([cpub, eph.getPublicKey()].sort(Buffer.compare)))
+    const k = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('c3join'), 32))
+    // sendBytes: these are COMPLETE frames already, do not wrap them again
+    this.sendBytes(conn, frame(T_JOINOK, Buffer.from(JSON.stringify({ p: eph.getPublicKey().toString('base64') }))))
+    this.sendBytes(conn, seal(k, T_HELLO, Buffer.from(JSON.stringify({ name: res.name, key: res.key }))))
+    dbg('[net] token accepted')
+    setTimeout(() => { try { conn.sock.destroy() } catch {} }, 3000).unref?.()
+  }
+}
+
+export async function makeNode(ident, port) {
+  const mesh = new Mesh(ident, port)
+  mesh.doc = new Y.Doc()
+  await mesh.start()
+  return mesh
+}
+
+// ---------- token join ----------
+export function joinResponder(mesh, getInvites, onRequest) {
+  mesh.join = { getInvites, onRequest, seen: new Set() }
+}
+
+function joinOnce(host, port, token, wait) {
+  return new Promise(resolve => {
+    let done = false
+    let buf = Buffer.alloc(0)
+    let k = null
+    let sock = null
+    let timer = null
+    const fin = v => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { sock?.destroy() } catch {}
+      resolve(v)
+    }
     try {
-      Promise.resolve(n.services.pubsub.publish(tpc, sealWith(a.sk, body)))
-        .catch(e => dbg('[invite] reply', e?.message || e))
-    } catch (e) { dbg('[invite] reply threw', e?.message || e) }
+      const eph = ecdh()
+      const h = sha(String(token)).toString('hex')
+      sock = net.connect({ host, port })
+      sock.setTimeout(wait, () => fin(null))
+      sock.on('error', () => fin(null))
+      sock.on('connect', () => {
+        sock.write(frame(T_JOIN, Buffer.from(JSON.stringify({ p: eph.getPublicKey().toString('base64'), h }))))
+      })
+      timer = setTimeout(() => fin(null), wait)
+      sock.on('data', d => {
+        try {
+          buf = buf.length ? Buffer.concat([buf, d]) : d
+          for (;;) {
+            if (buf.length < 4) return
+            const len = buf.readUInt32BE(0)
+            if (len < 1 || len > MAX_FRAME) return fin(null)
+            if (buf.length < 4 + len) return
+            const body = buf.subarray(4, 4 + len)
+            buf = buf.subarray(4 + len)
+            const type = body[0]
+            const payload = body.subarray(1)
+            if (type === T_JOINOK) {
+              const m = JSON.parse(payload.toString('utf8'))
+              const spub = Buffer.from(m.p, 'base64')
+              const shared = eph.computeSecret(spub)
+              const salt = sha(Buffer.concat([eph.getPublicKey(), spub].sort(Buffer.compare)))
+              k = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('c3join'), 32))
+            } else if (type === T_HELLO && k) {
+              const m = JSON.parse(unseal(k, type, payload).toString('utf8'))
+              if (m && typeof m.name === 'string' && typeof m.key === 'string') return fin({ name: m.name, key: m.key })
+              return fin(null)
+            }
+          }
+        } catch (e) { dbg('[net] join frame', e?.message || e); fin(null) }
+      })
+    } catch (e) { dbg('[net] join threw', e?.message || e); fin(null) }
   })
-
-  refresh()
-  const t = setInterval(refresh, 3000)
-  t.unref?.()
 }
 
-// ---------- token join (joiner side) ----------
-export async function joinCall(n, invite, wait = JOIN_WAIT) {
-  const sk = tokenKey(invite.t)
-  const tpc = tokenTopic(invite.t)
-  const nonce = crypto.randomBytes(8).toString('hex')
-
-  for (const a of invite.a) {
-    if (!isMa(a)) continue
-    try { n.dial(multiaddr(a)).catch(() => {}) } catch {}
+export async function joinCall(mesh, invite, wait = 8000) {
+  for (const a of invite.a || []) {
+    const hp = hpOf(a)
+    if (!hp) continue
+    if (!usableV4(hp.host) && !hp.host.includes(':') && hp.host !== 'localhost') continue
+    dbg('[net] join', hp.host, hp.port)
+    const res = await joinOnce(hp.host, hp.port, invite.t, wait)
+    if (res) return { ok: 1, name: res.name, key: res.key }
   }
-  try { Promise.resolve(n.services.pubsub.subscribe(tpc)).catch(() => {}) } catch {}
-  dbg('[join] listening on', tpc)
-  await new Promise(r => setTimeout(r, 500))
-
-  let settle = () => {}
-  const got = new Promise(r => { settle = r })
-  const onMsg = evt => {
-    if (topicOf(evt) !== tpc) return
-    let m
-    try { m = JSON.parse(openWith(sk, dataOf(evt)).toString('utf8')) } catch { return }
-    if (m?.n !== nonce || typeof m.name !== 'string' || typeof m.key !== 'string') return
-    settle({ ok: 1, name: m.name, key: m.key })
-  }
-  n.services.pubsub.addEventListener('message', onMsg)
-
-  const body = sealWith(sk, Buffer.from(JSON.stringify({ n: nonce })))
-  const until = Date.now() + wait
-  let out = null
-  while (!out && Date.now() < until) {
-    try {
-      Promise.resolve(n.services.pubsub.publish(tpc, body))
-        .catch(e => dbg('[join] publish', e?.message || e))
-    } catch (e) { dbg('[join] publish threw', e?.message || e) }
-    out = await Promise.race([got, new Promise(r => setTimeout(() => r(null), 1500))])
-  }
-
-  try { n.services.pubsub.removeEventListener('message', onMsg) } catch {}
-  try { Promise.resolve(n.services.pubsub.unsubscribe(tpc)).catch(() => {}) } catch {}
-  if (!out) dbg('[join] no reply on', tpc)
-  return out
+  return null
 }
 
-// ---------- encrypted gossip sync ----------
-export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
-  const topic = syncTopic(name, key)
+// ---------- encrypted sync ----------
+export function sync(mesh, name, key, doc, advertise, onAddrs = () => {}) {
   const aes = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key), Buffer.from('c3salt'), Buffer.from('c3msg'), 32))
+  mesh.doc = doc
+  mesh.session = { name, key, aes }
+  if (advertise) mesh.advertise = advertise
   const parts = new Map()
-  dbg('[sync] topic', topic)
-  dbg('[sync] peer', n.peerId.toString())
+  const seen = new Set()
+  const sendVec = () => mesh.sendAll(T_VECTOR, Buffer.from(Y.encodeStateVector(doc)))
+  const sendAddrs = () => mesh.sendAll(T_ADDRS, Buffer.from(JSON.stringify(mesh.addrsList(advertise))))
+  dbg('[net] session', name, 'id', mesh.id)
 
-  // publish -- NOT subscribe
-  const pub = b => {
-    try {
-      Promise.resolve(n.services.pubsub.publish(topic, sealWith(aes, b)))
-        .catch(e => dbg('[sync] publish', e?.message || e))
-    } catch (e) { dbg('[sync] publish threw', e?.message || e) }
-  }
-
-  const sendVec = () => pub(Buffer.concat([Buffer.from([T_VEC]), Buffer.from(Y.encodeStateVector(doc))]))
-  const sendAddr = () => pub(Buffer.concat([Buffer.from([T_ADDR]), Buffer.from(JSON.stringify(addrsOf(n, advertise)))]))
-
-  const sendUpd = u => {
+  const sendUpdate = u => {
     const data = Buffer.from(u)
     const id = crypto.createHash('sha1').update(data).digest().subarray(0, 8)
     const count = Math.max(1, Math.ceil(data.length / CHUNK))
-    dbg('[sync] send update', data.length, 'bytes in', count, 'chunk(s)')
+    dbg('[net] send update', data.length, 'bytes in', count, 'chunk(s)')
     for (let i = 0; i < count; i++) {
       const h = Buffer.allocUnsafe(13)
-      h[0] = T_CHUNK
+      h[0] = T_UPDATE
       id.copy(h, 1)
       h.writeUInt16BE(i, 9)
       h.writeUInt16BE(count, 11)
-      pub(Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]))
+      mesh.sendAll(T_UPDATE, Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]))
     }
   }
 
-  try { Promise.resolve(n.services.pubsub.subscribe(topic)).catch(() => {}) } catch {}
-
-  const reportMesh = () => {
-    try {
-      const subs = n.services.pubsub.getSubscribers(topic) || []
-      dbg('[sync] subscribers', subs.length)
-    } catch {}
-  }
-  const meshTimer = setInterval(reportMesh, 10000)
-  meshTimer.unref?.()
-
-  n.services.pubsub.addEventListener('message', evt => {
-    if (topicOf(evt) !== topic) return
-    let b
-    try { b = openWith(aes, dataOf(evt)) } catch { return }
-    const t = b[0]
-    if (t === T_VEC) {
-      const diff = Y.encodeStateAsUpdate(doc, b.subarray(1))
-      if (diff.length > 2) sendUpd(diff)
-    } else if (t === T_CHUNK) {
-      if (b.length < 13) return
-      const id = b.subarray(1, 9).toString('hex')
-      const i = b.readUInt16BE(9)
-      const count = b.readUInt16BE(11)
+  // emit() wraps in { detail } -- unwrap here, that was the dropped-update bug
+  mesh.on('message', ev => {
+    const { conn, type, payload } = ev.detail || {}
+    if (!type || !payload) return
+    if (type === T_VECTOR) {
+      const diff = Y.encodeStateAsUpdate(doc, payload)
+      if (diff.length > 2) sendUpdate(diff)
+    } else if (type === T_UPDATE) {
+      if (payload.length < 13) return
+      const id = payload.subarray(1, 9).toString('hex')
+      const i = payload.readUInt16BE(9)
+      const count = payload.readUInt16BE(11)
       if (count < 1 || count > 4096 || i >= count) return
       let e = parts.get(id)
       if (!e) { e = { count, got: 0, buf: [] }; parts.set(id, e) }
       if (e.count !== count || e.buf[i]) return
-      e.buf[i] = Buffer.from(b.subarray(13))
+      e.buf[i] = Buffer.from(payload.subarray(13))
       e.got++
       if (e.got === e.count) {
         parts.delete(id)
-        dbg('[sync] recv update', Buffer.concat(e.buf).length, 'bytes')
-        try { Y.applyUpdate(doc, Buffer.concat(e.buf), 'remote') } catch {}
+        const full = Buffer.concat(e.buf)
+        const hash = crypto.createHash('sha1').update(full).digest('hex')
+        if (seen.has(hash)) return
+        seen.add(hash)
+        if (seen.size > 2048) seen.clear()
+        dbg('[net] recv update', full.length, 'bytes')
+        try { Y.applyUpdate(doc, full, 'remote') } catch { return }
+        for (const c of mesh.conns) if (c !== conn && c.ready) mesh.sendSealed(c, T_UPDATE, payload)
       }
       if (parts.size > 256) parts.clear()
-    } else if (t === T_ADDR) {
+    } else if (type === T_ADDRS) {
       let addrs
-      try { addrs = JSON.parse(b.subarray(1).toString('utf8')) } catch { return }
-      if (Array.isArray(addrs)) onAddrs(addrs.filter(isMa).slice(0, MAX_ADDR))
+      try { addrs = JSON.parse(payload.toString('utf8')) } catch { return }
+      if (Array.isArray(addrs)) onAddrs(addrs.filter(a => typeof a === 'string' && /\/p2p\//.test(a)).slice(0, MAX_ADDR))
     }
   })
 
+  mesh.on('addrs', ev => { if (Array.isArray(ev.detail)) onAddrs(ev.detail) })
+  mesh.on('peer:connect', () => { sendVec(); sendAddrs() })
   doc.on('update', (u, origin) => {
-    if (origin !== 'remote' && origin !== 'restore') sendUpd(u)
+    if (origin !== 'remote' && origin !== 'restore') sendUpdate(u)
   })
-  n.addEventListener('peer:connect', () => { sendVec(); sendAddr() })
-  const timer = setInterval(() => { sendVec(); sendAddr() }, 8000)
+
+  for (const c of mesh.conns) if (!c.ready) mesh.sendHello(c)
+  const timer = setInterval(() => { sendVec(); sendAddrs() }, 8000)
   timer.unref?.()
   sendVec()
-  sendAddr()
-  return { topic, sendVec, sendAddr }
+  sendAddrs()
+  return { sendVec, sendAddrs }
 }

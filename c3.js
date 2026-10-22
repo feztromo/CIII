@@ -5,11 +5,11 @@
 //   node c3.js config
 //   node c3.js connect
 //   node c3.js invite
-//   node c3.js join 'c3://join/...'
+//   node c3.js join "c3://join/..."
 // No host. No DHT. No third-party relay. Every peer listens, dials, relays,
 // and holds a full replica. Invites carry a one-time token; the session key
-// travels only inside the token-keyed encrypted topic. File payloads are
-// AES-256-GCM with the session key over libp2p Noise. Node 22+.
+// travels only inside the token handshake. Payloads are AES-256-GCM with the
+// session key over plain TCP. Node 22+.
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
 import { execFileSync } from 'node:child_process'
@@ -19,7 +19,6 @@ import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import net from 'node:net'
-import { multiaddr } from '@multiformats/multiaddr'
 import { loadKey, makeNode, joinCall, joinResponder, sync, addrsOf, toMa, tokenKey, tokenTopic } from './net.js'
 
 const argv = process.argv.slice(2)
@@ -47,7 +46,7 @@ const SEED_BYTES = 200 << 20
 const PEER_WAIT_MS = 5000
 const STATE_WAIT_MS = 12000
 const WRITE_DEBOUNCE_MS = 40
-const SCAN_MS = 1500
+const SCAN_MS = 8000          // polling is only a fallback now; fs.watch is instant
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const die = m => { console.error(m); process.exit(1) }
 const mkdirp = a => fs.mkdirSync(a, { recursive: true })
@@ -70,13 +69,6 @@ const git = (...a) => execFileSync('git', a, { cwd: workDir, encoding: 'utf8', m
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
 const readConfig = () => { try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch { return null } }
 const canonUrl = u => u.replace(/^[a-z+]+:\/\//, '').replace(/^[^@]+@/, '').replace(/\.git$/, '').replace(/^([^/]+):/, '$1/')
-const boundPort = (n, fallback) => {
-  for (const a of n.getMultiaddrs()) {
-    const m = a.toString().match(/\/tcp\/(\d+)/)
-    if (m) return Number(m[1])
-  }
-  return fallback
-}
 
 // ---------- session paths ----------
 const sidOf = name => crypto.createHash('sha256').update('c3sid\0' + name).digest()
@@ -334,11 +326,16 @@ function makeBackend(config) {
         if (gitOk('status', '--porcelain') === '') return { saved: false }
         const idc = gitOk('config', 'user.name') && gitOk('config', 'user.email') ? [] : ['-c', 'user.name=c3', '-c', 'user.email=c3@localhost']
         git(...idc, 'commit', '-m', meta.message)
-        try { git('push'); return { saved: true, pushed: true } }
+        // integrate remote first so the push is never non-fast-forward;
+        // conflicts resolve in OUR favor = last writer wins
+        gitOk('fetch')
+        try { git('merge', '-X', 'ours', '--no-edit', '@{u}') }
         catch {
-          try { git('pull', '--rebase'); git('push'); return { saved: true, pushed: true } }
-          catch { gitOk('rebase', '--abort'); return { saved: true, pushed: false } }
+          try { gitOk('merge', '--abort') } catch {}
+          return { saved: true, pushed: false }
         }
+        try { git('push'); return { saved: true, pushed: true } }
+        catch { return { saved: true, pushed: false } }
       }
     }
   }
@@ -407,7 +404,7 @@ async function connect(invite) {
   const advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
   if (advertise && !toMa(advertise, 'x')) die('--advertise must be host:port.')
   const n = await makeNode(ident, wantPort)
-  const port = boundPort(n, wantPort)
+  const port = n.port || wantPort
   const me = {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'peer'),
     email: gitOk('config', 'user.email') ?? ''
@@ -416,6 +413,7 @@ async function connect(invite) {
   let leaving = false
   let peerTimer = null, snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null
   let started = false
+  let watcher = null
   const peerCount = () => new Set(n.getConnections().map(c => c.remotePeer.toString())).size
   const addPeer = a => {
     if (!sdir) return
@@ -436,7 +434,7 @@ async function connect(invite) {
       if (count >= 8) break
       const m = a.match(/\/p2p\/([^/]+)$/)
       if (!m || live.has(m[1])) continue
-      try { n.dial(multiaddr(a)).catch(() => {}) } catch {}
+      try { n.dial(a).catch(() => {}) } catch {}
       count++
     }
   }
@@ -468,7 +466,7 @@ async function connect(invite) {
     name = flag('name') ?? cfg0.name ?? die('No session name. Run `c3 config`.')
     sdir = sdirOf(name)
     sKey = flag('key') ?? process.env.C3_KEY ?? readKey(sdir)
-    if (!sKey) die(`No session key. Run \`c3 config\`, or join with an invite:\n  node c3.js join 'c3://join/...'`)
+    if (!sKey) die(`No session key. Run \`c3 config\`, or join with an invite:\n  node c3.js join "c3://join/..."`)
     if (flag('key')) writeKey(sdir, sKey)
     cfg = { ...cfg0, name, port }
     if (!cfg.backend) cfg.backend = fs.existsSync(path.join(workDir, '.git')) ? 'git' : 'none'
@@ -532,7 +530,7 @@ async function connect(invite) {
   }
   const restored = restoreState()
 
-  // ---------- join responder + encrypted gossip ----------
+  // ---------- join responder + encrypted sync ----------
   joinResponder(n, () => readInvites(sdir), (entry, nonce, replay) => {
     const list = readInvites(sdir)
     const inv = list.find(x => x.tpc === entry.tpc)
@@ -583,11 +581,41 @@ async function connect(invite) {
       }
     } catch {}
   }
+  function quick(rel) {
+    if (!rel) return
+    const now = Date.now()
+    if (pendingWrites.has(rel)) return
+    if ((lastWritten.get(rel) ?? 0) > now - 300) return
+    let st
+    try { st = fs.statSync(path.join(workDir, rel)) } catch {
+      if (files.has(rel)) removeFromDoc(rel)
+      return
+    }
+    if (!st.isFile()) return
+    const sig = st.mtimeMs + ':' + st.size
+    if (diskMeta.get(rel) === sig) return
+    diskMeta.set(rel, sig)
+    syncFromDisk(rel)
+  }
   function startScan() {
     if (started) return
     started = true
-    scanTimer = setInterval(scan, SCAN_MS)
     scan()
+    try {
+      watcher = fs.watch(workDir, { recursive: true }, (_evt, file) => {
+        if (!file) return
+        const rel = String(file).split(path.sep).join('/')
+        if (!rel) return
+        if (rel === '.git' || rel.startsWith('.git/')) return
+        if (rel === '.c3' || rel.startsWith('.c3/')) return
+        if (c3InsideWork && (rel === c3Rel || rel.startsWith(c3Rel + '/'))) return
+        quick(rel)
+      })
+      watcher.on('error', () => {})
+    } catch {
+      ui.warn('instant file watching unavailable -- using polling (slower)')
+    }
+    scanTimer = setInterval(scan, SCAN_MS)
   }
   function seedFromDisk() {
     const seed = walkTree()
@@ -613,6 +641,7 @@ async function connect(invite) {
     if (leaving) return
     leaving = true
     clearInterval(scanTimer); clearTimeout(snapTimer); clearTimeout(peerTimer); clearInterval(tick); clearInterval(dialTimer); clearInterval(addrsTimer)
+    try { watcher?.close() } catch {}
     flushWrites()
     snapshotNow()
     ui.clear()
@@ -643,7 +672,7 @@ async function connect(invite) {
 
   // ---------- boot ----------
   n.addEventListener('peer:connect', evt => {
-    const id = evt.detail.toString()
+    const id = evt?.detail?.toString?.() ?? 'peer'
     ui.say(`peer ${id.slice(0, 8)} connected`)
     dialPeers()
   })
@@ -758,6 +787,9 @@ async function configCmd() {
   console.log('  node c3.js connect')
   console.log('Then mint an invite (share in chat):')
   console.log(`  node c3.js invite --name "${name}"`)
+  console.log('')
+  console.log('Peers join with double quotes (works in cmd and PowerShell):')
+  console.log('  node c3.js join "c3://join/..."')
 }
 
 // ---------- invite ----------
@@ -782,8 +814,8 @@ function inviteCmd() {
   console.log('')
   console.log('  ' + url)
   console.log('')
-  console.log('Peer runs:')
-  console.log(`  node c3.js join '${url}'`)
+  console.log('Peer runs (double quotes, works in cmd and PowerShell):')
+  console.log(`  node c3.js join "${url}"`)
   console.log('')
   console.log('The token burns on use. The session key travels only inside the encrypted channel.')
 }
@@ -867,9 +899,10 @@ How it works:
   No host, no DHT, no central service. Every peer is a full replica,
   listener, dialer, and gossip relay. Peers meet through invite endpoints
   and cached multiaddrs. First contact needs one out-of-band invite plus
-  one reachable peer; after that the group is self-describing. File
-  payloads use AES-256-GCM with the session key over libp2p Noise. Same
-  session name + key = same room.
+  one reachable peer; after that the group is self-describing. Payloads
+  use AES-256-GCM with the session key over plain TCP. Same session name
+  + key = same room. On Windows cmd use double quotes:
+  node c3.js join "c3://join/..."
 `
 loadIgnoreRules()
 if (cmd === 'config') await configCmd()
