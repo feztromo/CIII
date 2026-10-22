@@ -1,5 +1,6 @@
 // net.js -- libp2p transport, token join, encrypted gossip for c3.
-// No DHT. No public relay. No third-party discovery.
+// Join rides on gossipsub, so there is no custom stream protocol to break
+// across libp2p majors. No DHT. No public relay. No third-party discovery.
 import * as Y from 'yjs'
 import { createLibp2p } from 'libp2p'
 import { tcp } from '@libp2p/tcp'
@@ -13,74 +14,30 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 
-const AUTH = '/c3/auth/1'
 const T_ADDR = 0
 const T_VEC = 1
 const T_CHUNK = 2
 const CHUNK = 32 * 1024
 const MAX_ADDR = 8
-const MAX_MSG = 8192
-const ONE = b => (async function* () { yield b })()
+const JOIN_WAIT = 15000
 const isMa = a => typeof a === 'string' && /^\/(ip4|ip6|dns)\//.test(a) && /\/tcp\/\d{1,5}\/p2p\/[^/]+$/.test(a)
 const dbg = (...a) => { if (process.env.C3_DEBUG) console.error(...a) }
 
-// ---------- stream helpers (tolerate old and new libp2p APIs) ----------
-async function readAll(stream, timeout = 8000) {
-  if (!stream) throw new Error('no stream')
-  const collect = async () => {
-    const chunks = []
-    let len = 0
-    if (stream.source) {
-      for await (const c of stream.source) {
-        len += c.length
-        if (len > MAX_MSG) throw new Error('too big')
-        chunks.push(Buffer.from(c.subarray()))
-      }
-      return Buffer.concat(chunks)
-    }
-    if (typeof stream.recv === 'function') {
-      const c = await stream.recv()
-      return c ? Buffer.from(c.subarray()) : Buffer.alloc(0)
-    }
-    throw new Error('unsupported stream')
-  }
-  return Promise.race([
-    collect(),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('read timeout')), timeout))
-  ])
+// ---------- keyed AEAD ----------
+const sealWith = (key, b) => {
+  const iv = crypto.randomBytes(12)
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv)
+  const ct = Buffer.concat([c.update(b), c.final()])
+  return Buffer.concat([iv, ct, c.getAuthTag()])
 }
-
-async function writeAll(stream, buf) {
-  if (!stream) throw new Error('no stream')
-  if (stream.sink) {
-    await stream.sink(ONE(buf))
-    try { await stream.closeWrite?.() } catch {}
-    return
-  }
-  if (typeof stream.send === 'function') {
-    await stream.send(buf)
-    try { await stream.close?.() } catch {}
-    return
-  }
-  throw new Error('unsupported stream')
+const openWith = (key, b) => {
+  if (b.length < 29) throw new Error('short')
+  const d = crypto.createDecipheriv('aes-256-gcm', key, b.subarray(0, 12))
+  d.setAuthTag(b.subarray(b.length - 16))
+  return Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()])
 }
-
-async function closeStream(stream) {
-  try {
-    if (typeof stream?.close === 'function') await stream.close()
-    else stream?.abort?.()
-  } catch {}
-}
-
-const streamOf = r => r?.stream ?? r
-
-function freePort() {
-  return new Promise((res, rej) => {
-    const s = net.createServer()
-    s.once('error', rej)
-    s.listen(0, '0.0.0.0', () => { const p = s.address().port; s.close(() => res(p)) })
-  })
-}
+export const tokenKey = tok => crypto.createHash('sha256').update('c3tok\0' + tok).digest()
+export const tokenTopic = tok => 'c3join/' + crypto.createHash('sha256').update('c3join\0' + tok).digest('hex')
 
 // ---------- identity ----------
 export async function loadKey(file) {
@@ -94,17 +51,23 @@ export async function loadKey(file) {
 }
 
 // ---------- node ----------
+const freePort = () => new Promise((res, rej) => {
+  const s = net.createServer()
+  s.once('error', rej)
+  s.listen(0, '0.0.0.0', () => { const p = s.address().port; s.close(() => res(p)) })
+})
+
 export async function makeNode(key, port) {
-  const build = p => createLibp2p({
+  const want = Number(port)
+  const p = Number.isInteger(want) && want > 0 ? want : await freePort()
+  const build = q => createLibp2p({
     privateKey: key,
-    addresses: { listen: [`/ip4/0.0.0.0/tcp/${p}`] },
+    addresses: { listen: [`/ip4/0.0.0.0/tcp/${q}`] },
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     services: { identify: identify(), pubsub: gossipsub() }
   })
-  const want = Number(port)
-  let p = Number.isInteger(want) && want > 0 ? want : await freePort()
   let n
   try {
     n = await build(p)
@@ -147,44 +110,69 @@ export function addrsOf(n, advertise) {
   return [...out]
 }
 
-// ---------- token auth over a libp2p stream ----------
-export function authServer(n, handler) {
-  const handle = async (first, second) => {
-    const stream = first?.stream ?? first
-    const connection = first?.connection ?? second
-    let out = Buffer.from(JSON.stringify({ ok: 0 }))
-    try {
-      const req = JSON.parse((await readAll(stream)).toString('utf8'))
-      const peer = connection?.remotePeer?.toString?.() ?? ''
-      const res = await handler(req, peer)
-      if (res) out = Buffer.from(JSON.stringify(res))
-    } catch (e) { dbg('[auth-server]', e?.message || e) }
-    try { await writeAll(stream, out) } catch (e) { dbg('[auth-server-write]', e?.message || e) }
-    await closeStream(stream)
+// ---------- token join (host side) ----------
+// getInvites() -> [{ tpc, sk(base64), exp, uses, used }]
+// onRequest(entry, nonce, replay) -> { name, key } | null
+export function joinResponder(n, getInvites, onRequest) {
+  const active = new Map()
+  const served = new Map()
+  const refresh = () => {
+    let list = []
+    try { list = getInvites() } catch { return }
+    for (const inv of list) {
+      if (!inv?.tpc || !inv?.sk || active.has(inv.tpc)) continue
+      if (!(inv.exp > Date.now())) continue
+      active.set(inv.tpc, { sk: Buffer.from(inv.sk, 'base64'), entry: inv })
+      try { Promise.resolve(n.services.pubsub.subscribe(inv.tpc)).catch(() => {}) } catch {}
+    }
   }
-  n.handle(AUTH, handle)
+  n.services.pubsub.addEventListener('message', evt => {
+    const a = active.get(evt.detail.topic)
+    if (!a) return
+    let req
+    try { req = JSON.parse(openWith(a.sk, Buffer.from(evt.detail.data)).toString('utf8')) } catch { return }
+    if (!req || typeof req.n !== 'string') return
+    let set = served.get(evt.detail.topic)
+    if (!set) { set = new Set(); served.set(evt.detail.topic, set) }
+    const res = onRequest(a.entry, req.n, set.has(req.n))
+    if (!res) return
+    set.add(req.n)
+    const body = Buffer.from(JSON.stringify({ n: req.n, name: res.name, key: res.key }))
+    try { Promise.resolve(n.services.pubsub.publish(evt.detail.topic, sealWith(a.sk, body))).catch(() => {}) } catch {}
+  })
+  refresh()
+  const t = setInterval(refresh, 3000)
+  t.unref?.()
 }
 
-export async function authCall(n, addrs, req) {
-  const body = Buffer.from(JSON.stringify(req))
-  for (const a of addrs) {
-    if (!isMa(a)) continue
-    let stream = null
-    try {
-      const r = await Promise.race([
-        n.dialProtocol(multiaddr(a), AUTH),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('dial timeout')), 8000))
-      ])
-      stream = streamOf(r)
-      await writeAll(stream, body)
-      const res = JSON.parse((await readAll(stream)).toString('utf8'))
-      if (res?.ok) return res
-      dbg('[auth] rejected:', a, JSON.stringify(res))
-    } catch (e) {
-      dbg('[auth]', a, e?.message || e)
-    } finally { await closeStream(stream) }
+// ---------- token join (joiner side) ----------
+export async function joinCall(n, invite, wait = JOIN_WAIT) {
+  const sk = tokenKey(invite.t)
+  const tpc = tokenTopic(invite.t)
+  const nonce = crypto.randomBytes(8).toString('hex')
+  for (const a of invite.a) if (isMa(a)) { try { n.dial(multiaddr(a)).catch(() => {}) } catch {} }
+  try { await n.services.pubsub.subscribe(tpc) } catch {}
+  let settle = () => {}
+  const got = new Promise(r => { settle = r })
+  const onMsg = evt => {
+    if (evt.detail.topic !== tpc) return
+    let m
+    try { m = JSON.parse(openWith(sk, Buffer.from(evt.detail.data)).toString('utf8')) } catch { return }
+    if (m?.n !== nonce || typeof m.name !== 'string' || typeof m.key !== 'string') return
+    settle({ ok: 1, name: m.name, key: m.key })
   }
-  return null
+  n.services.pubsub.addEventListener('message', onMsg)
+  const body = sealWith(sk, Buffer.from(JSON.stringify({ n: nonce })))
+  const until = Date.now() + wait
+  let out = null
+  while (!out && Date.now() < until) {
+    try { n.services.pubsub.publish(tpc, body).catch(() => {}) } catch {}
+    out = await Promise.race([got, new Promise(r => setTimeout(() => r(null), 1500))])
+  }
+  try { n.services.pubsub.removeEventListener('message', onMsg) } catch {}
+  try { await n.services.pubsub.unsubscribe(tpc) } catch {}
+  if (!out) dbg('[join] no reply on', tpc)
+  return out
 }
 
 // ---------- encrypted gossip sync ----------
@@ -193,19 +181,7 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
   const aes = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key), Buffer.from('c3salt'), Buffer.from('c3msg'), 32))
   const parts = new Map()
 
-  const seal = b => {
-    const iv = crypto.randomBytes(12)
-    const c = crypto.createCipheriv('aes-256-gcm', aes, iv)
-    const ct = Buffer.concat([c.update(b), c.final()])
-    return Buffer.concat([iv, ct, c.getAuthTag()])
-  }
-  const open = b => {
-    if (b.length < 12 + 16) throw new Error('short')
-    const d = crypto.createDecipheriv('aes-256-gcm', aes, b.subarray(0, 12))
-    d.setAuthTag(b.subarray(b.length - 16))
-    return Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()])
-  }
-  const pub = b => n.services.pubsub.publish(topic, seal(b)).catch(() => {})
+  const pub = b => { try { Promise.resolve(n.services.pubsub.publish(topic, sealWith(aes, b))).catch(() => {}) } catch {} }
   const sendVec = () => pub(Buffer.concat([Buffer.from([T_VEC]), Buffer.from(Y.encodeStateVector(doc))]))
   const sendAddr = () => pub(Buffer.concat([Buffer.from([T_ADDR]), Buffer.from(JSON.stringify(addrsOf(n, advertise)))]))
 
@@ -223,11 +199,11 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
     }
   }
 
-  n.services.pubsub.subscribe(topic)
+  n.services.pubsub.subscribe(topic).catch?.(() => {})
   n.services.pubsub.addEventListener('message', evt => {
     if (evt.detail.topic !== topic) return
     let b
-    try { b = open(Buffer.from(evt.detail.data)) } catch { return }
+    try { b = openWith(aes, Buffer.from(evt.detail.data)) } catch { return }
     const t = b[0]
     if (t === T_VEC) {
       const diff = Y.encodeStateAsUpdate(doc, b.subarray(1))
@@ -260,7 +236,7 @@ export function sync(n, name, key, doc, advertise, onAddrs = () => {}) {
   })
   n.addEventListener('peer:connect', () => { sendVec(); sendAddr() })
   const timer = setInterval(() => { sendVec(); sendAddr() }, 8000)
-  if (timer.unref) timer.unref()
+  timer.unref?.()
   sendVec()
   sendAddr()
   return { topic, sendVec, sendAddr }
