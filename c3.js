@@ -9,7 +9,8 @@
 // No host. No DHT. No third-party relay. Every peer listens, dials, relays,
 // and holds a full replica. Invites carry a one-time token; the session key
 // travels only inside the token handshake. Payloads are AES-256-GCM with the
-// session key over plain TCP. Node 22+.
+// session key over plain TCP, or WebSocket when --ws is enabled.
+// Node 22+.
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
 import { execFileSync } from 'node:child_process'
@@ -46,7 +47,7 @@ const SEED_BYTES = 200 << 20
 const PEER_WAIT_MS = 5000
 const STATE_WAIT_MS = 12000
 const WRITE_DEBOUNCE_MS = 40
-const SCAN_MS = 8000          // polling is only a fallback now; fs.watch is instant
+const SCAN_MS = 8000            // polling is only a fallback; fs.watch is instant
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const die = m => { console.error(m); process.exit(1) }
 const mkdirp = a => fs.mkdirSync(a, { recursive: true })
@@ -68,7 +69,6 @@ function warnOnce(key, ...a) { if (!onceWarned.has(key)) { onceWarned.add(key); 
 const git = (...a) => execFileSync('git', a, { cwd: workDir, encoding: 'utf8', maxBuffer: 1 << 26 }).trim()
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
 const readConfig = () => { try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch { return null } }
-const canonUrl = u => u.replace(/^[a-z+]+:\/\//, '').replace(/^[^@]+@/, '').replace(/\.git$/, '').replace(/^([^/]+):/, '$1/')
 
 // ---------- session paths ----------
 const sidOf = name => crypto.createHash('sha256').update('c3sid\0' + name).digest()
@@ -318,7 +318,17 @@ function makeBackend(config) {
     return {
       kind: 'git',
       excluded: null,
-      prepare() { gitOk('fetch') },
+      prepare() {
+        gitOk('fetch')
+        // never start a session on a detached HEAD
+        if (gitOk('rev-parse', '--abbrev-ref', 'HEAD') === 'HEAD') {
+          for (const b of ['master', 'main']) {
+            if (gitOk('rev-parse', '--verify', '--quiet', 'refs/heads/' + b)) {
+              try { git('checkout', b); break } catch {}
+            }
+          }
+        }
+      },
       generation: () => gitOk('rev-parse', 'HEAD') ?? 'no-head',
       save(paths, meta) {
         const list = [...paths]
@@ -326,16 +336,20 @@ function makeBackend(config) {
         if (gitOk('status', '--porcelain') === '') return { saved: false }
         const idc = gitOk('config', 'user.name') && gitOk('config', 'user.email') ? [] : ['-c', 'user.name=c3', '-c', 'user.email=c3@localhost']
         git(...idc, 'commit', '-m', meta.message)
-        // integrate remote first so the push is never non-fast-forward;
-        // conflicts resolve in OUR favor = last writer wins
-        gitOk('fetch')
-        try { git('merge', '-X', 'ours', '--no-edit', '@{u}') }
-        catch {
+        // last writer wins: integrate the remote with conflicts resolved to OUR
+        // tree, then push. Never uses rebase, never leaves a half-applied merge.
+        try { git('push'); return { saved: true, pushed: true } } catch {}
+        try {
+          gitOk('fetch')
+          git('merge', '-X', 'ours', '--no-edit', '@{u}')
+        } catch {
           try { gitOk('merge', '--abort') } catch {}
+          if (config.forcePush !== false) {
+            try { git('push', '--force'); return { saved: true, pushed: true, forced: true } } catch {}
+          }
           return { saved: true, pushed: false }
         }
-        try { git('push'); return { saved: true, pushed: true } }
-        catch { return { saved: true, pushed: false } }
+        try { git('push'); return { saved: true, pushed: true } } catch { return { saved: true, pushed: false } }
       }
     }
   }
@@ -387,7 +401,7 @@ function parseInvite(s) {
   try {
     const j = JSON.parse(Buffer.from(m[1], 'base64url').toString('utf8'))
     if (j.v !== 5 || typeof j.t !== 'string' || j.t.length < 16 || !Array.isArray(j.a)) return null
-    return { t: j.t, a: j.a.filter(x => typeof x === 'string').slice(0, 8) }
+    return { t: j.t, a: j.a.filter(x => typeof x === 'string').slice(0, 12) }
   } catch { return null }
 }
 const inviteUrl = (token, addrs) =>
@@ -399,11 +413,15 @@ async function connect(invite) {
   mkdirp(SESSION_DIR)
   const ident = await loadKey(path.join(SESSION_DIR, 'identity.key'))
   let name = null, sKey = null, sdir = null, cfg = cfg0
+
   const wantPort = Number(flag('port') ?? (invite ? 0 : cfg0.port ?? DEFAULT_PORT))
-  if (wantPort !== 0 && (!Number.isInteger(wantPort) || wantPort < 1 || wantPort > 65535)) die('Bad port.')
+  if (wantPort !== 0 && (!Number.isInteger(wantPort) || wantPort < 1 || wantPort > 65535)) die('Bad --port.')
+  const wantWs = Number(flag('ws') ?? cfg0.wsPort ?? 0)
+  if (wantWs && (!Number.isInteger(wantWs) || wantWs < 1 || wantWs > 65535)) die('Bad --ws port.')
   const advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
   if (advertise && !toMa(advertise, 'x')) die('--advertise must be host:port.')
-  const n = await makeNode(ident, wantPort)
+
+  const n = await makeNode(ident, wantPort, { wsPort: wantWs })
   const port = n.port || wantPort
   const me = {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'peer'),
@@ -456,6 +474,7 @@ async function connect(invite) {
     writeKey(sdir, sKey)
     atomicWrite(path.join(sdir, 'name'), JSON.stringify({ name }))
     cfg = { ...cfg0, name, port }
+    if (wantWs) cfg.wsPort = wantWs
     if (!cfg.backend) cfg.backend = fs.existsSync(path.join(workDir, '.git')) ? 'git' : 'none'
     if (advertise) cfg.advertise = advertise
     atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2))
@@ -469,6 +488,7 @@ async function connect(invite) {
     if (!sKey) die(`No session key. Run \`c3 config\`, or join with an invite:\n  node c3.js join "c3://join/..."`)
     if (flag('key')) writeKey(sdir, sKey)
     cfg = { ...cfg0, name, port }
+    if (wantWs) cfg.wsPort = wantWs
     if (!cfg.backend) cfg.backend = fs.existsSync(path.join(workDir, '.git')) ? 'git' : 'none'
     if (advertise) cfg.advertise = advertise
     atomicWrite(path.join(sdir, 'name'), JSON.stringify({ name }))
@@ -660,7 +680,7 @@ async function connect(invite) {
         else if (backend.kind === 'none') ui.say('No archive -- run `c3 export <dir>` to keep a copy.')
         else if (r.pushed === false) ui.warn('Could not publish -- commit kept locally.')
         else if (r.saved === false) { ui.say('Nothing changed -- nothing to save.'); removeState() }
-        else { removeState(); ui.say(r.snapshot ? `Snapshot written: ${r.snapshot}` : 'Saved and pushed.') }
+        else { removeState(); ui.say(r.forced ? 'Saved and pushed (remote overwritten).' : r.snapshot ? `Snapshot written: ${r.snapshot}` : 'Saved and pushed.') }
       }
     } catch (err) {
       console.error('Save failed -- state kept locally:', err.message)
@@ -681,7 +701,7 @@ async function connect(invite) {
   const addrsFile = path.join(sdir, 'addrs.json')
   const writeAddrs = () => {
     try {
-      atomicWrite(addrsFile, JSON.stringify({ id: n.peerId.toString(), addrs: addrsOf(n, advertise), port }))
+      atomicWrite(addrsFile, JSON.stringify({ id: n.peerId.toString(), addrs: addrsOf(n, advertise), port, wsPort: n.wsPort || 0 }))
       chmod(addrsFile, 0o600)
     } catch {}
   }
@@ -710,7 +730,7 @@ async function connect(invite) {
 
   tick = setInterval(() => {
     const p = peerCount()
-    ui.set(`live - ${p} peer${p === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}${advertise ? ' - advertised' : ''}`)
+    ui.set(`live - ${p} peer${p === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}${advertise ? ' - advertised' : ''}${n.wsPort ? ' - ws' : ''}`)
   }, 2000)
   ui.say('Ready. Ctrl+C to leave.')
   const bye = () => { clearInterval(tick); clearInterval(dialTimer); clearInterval(addrsTimer); leave() }
@@ -764,11 +784,15 @@ async function configCmd() {
   writeKey(sdir, key)
   const port = Number(flag('port') ?? await ask('Listening TCP port', String(DEFAULT_PORT)))
   if (!Number.isInteger(port) || port < 1 || port > 65535) die('Bad port.')
+  const wsAns = String(flag('ws') ?? await ask('WebSocket port (blank = off, needs "npm i ws")', '')).trim()
+  const wsPort = wsAns ? Number(wsAns) : 0
+  if (wsPort && (!Number.isInteger(wsPort) || wsPort < 1 || wsPort > 65535)) die('Bad WebSocket port.')
   const advertise = String(flag('advertise') ?? await ask('Reachable host:port (blank = LAN/invite only)', '')).trim()
   if (advertise && !toMa(advertise, 'x')) die('Advertise must be host:port.')
   const cfg = { backend: kind, name, port }
   if (archivePath) cfg.archive = archivePath
   if (advertise) cfg.advertise = advertise
+  if (wsPort) cfg.wsPort = wsPort
   atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2))
   chmod(CONFIG_FILE, 0o600)
   atomicWrite(path.join(sdir, 'name'), JSON.stringify({ name }))
@@ -790,6 +814,7 @@ async function configCmd() {
   console.log('')
   console.log('Peers join with double quotes (works in cmd and PowerShell):')
   console.log('  node c3.js join "c3://join/..."')
+  if (wsPort) console.log('WebSocket path is available at /c3 on port ' + wsPort + '.')
 }
 
 // ---------- invite ----------
@@ -800,7 +825,7 @@ function inviteCmd() {
   if (!readKey(sdir)) die('No session key. Run `c3 config`.')
   let addrs = []
   try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
-  addrs = addrs.filter(a => typeof a === 'string' && /\/p2p\//.test(a)).slice(0, 8)
+  addrs = addrs.filter(a => typeof a === 'string' && /\/p2p\//.test(a)).slice(0, 12)
   if (!addrs.length) die('No running endpoint. Start `node c3.js connect` first (and set "advertise" if needed).')
   const ttl = Number(flag('ttl') ?? 24) * 3600000
   const uses = Number(flag('uses') ?? 1)
@@ -817,6 +842,7 @@ function inviteCmd() {
   console.log('Peer runs (double quotes, works in cmd and PowerShell):')
   console.log(`  node c3.js join "${url}"`)
   console.log('')
+  if (addrs.some(a => a.includes('/ws'))) console.log('Includes a WebSocket endpoint (needs "npm i ws" on the joining peer).')
   console.log('The token burns on use. The session key travels only inside the encrypted channel.')
 }
 
@@ -850,18 +876,23 @@ async function doctor() {
   let isIgnored = false
   try { execFileSync('git', ['check-ignore', '-q', c3Name + '/'], { cwd: workDir, stdio: 'ignore' }); isIgnored = true } catch {}
   ok('c3 ignored by git', isIgnored, `add "${c3Name}/" to .gitignore`)
+  let wsInstalled = false
+  try { await import('ws'); wsInstalled = true } catch {}
+  if (wsInstalled) lines.push(`${C.grn}+${C.r} ws package`)
+  else lines.push(`${C.cyn}i${C.r} ws package not installed (optional, npm i ws)`)
   if (cfg) {
     try {
       const sdir = sdirOf(cfg.name)
       ok('session name present', !!cfg.name, 'run `c3 config`')
       ok('session key present', !!readKey(sdir), 'run `c3 config`')
-      const port = Number(cfg.port ?? DEFAULT_PORT)
-      const free = await new Promise(res => {
+      const tryPort = async p => new Promise(res => {
         const s = net.createServer()
         s.once('error', () => res(false))
-        s.listen(port, () => s.close(() => res(true)))
+        s.listen(p, () => s.close(() => res(true)))
       })
-      ok(`port ${port} bindable`, free, 'running connect may already hold it')
+      const port = Number(cfg.port ?? DEFAULT_PORT)
+      ok(`port ${port} bindable`, await tryPort(port), 'running connect may already hold it')
+      if (cfg.wsPort) ok(`ws port ${cfg.wsPort} bindable`, await tryPort(cfg.wsPort), 'running connect may already hold it')
       let addrs = []
       try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
       ok('running endpoint known', addrs.length > 0, 'run `connect`, then `invite`')
@@ -869,7 +900,7 @@ async function doctor() {
     } catch (e) { ok('config valid', false, e.message) }
   }
   lines.push(`${C.cyn}i${C.r} discovery: invite endpoints + cached peers`)
-  lines.push(`${C.cyn}i${C.r} no DHT, no third-party relay, token-gated join`)
+  lines.push(`${C.cyn}i${C.r} transports: tcp${cfg?.wsPort ? ' + websocket' : ''} -- no DHT, no third-party relay`)
   ui.clear()
   console.log(lines.join('\n'))
   console.log(failed ? 'Some checks failed.' : 'All good.')
@@ -889,6 +920,7 @@ Flags:
   --key <k>         session key
   --peer <ma>       cached peer multiaddr (repeatable)
   --port <n>        listening TCP port (default 8443)
+  --ws <port>       also listen for WebSocket peers (needs: npm i ws)
   --advertise <h:p> reachable endpoint shared with session peers
   --seed            publish this directory into an empty joined session
   --ttl <hours>     invite lifetime (default 24)
@@ -900,9 +932,14 @@ How it works:
   listener, dialer, and gossip relay. Peers meet through invite endpoints
   and cached multiaddrs. First contact needs one out-of-band invite plus
   one reachable peer; after that the group is self-describing. Payloads
-  use AES-256-GCM with the session key over plain TCP. Same session name
-  + key = same room. On Windows cmd use double quotes:
-  node c3.js join "c3://join/..."
+  use AES-256-GCM with the session key over plain TCP, or WebSocket when
+  --ws is enabled. Same session name + key = same room. On Windows cmd
+  use double quotes: node c3.js join "c3://join/..."
+Config options (c3/.c3/config.json):
+  "verify": "npm test"      run before publishing
+  "forcePush": false        disable last-writer force push fallback
+  "wsPort": 9443            default WebSocket port
+  "advertise": "host:port"  reachable endpoint to share
 `
 loadIgnoreRules()
 if (cmd === 'config') await configCmd()
