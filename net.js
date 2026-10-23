@@ -1,11 +1,12 @@
-// net.js -- TCP + optional WebSocket transport for c3.
+// net.js -- TCP + optional WebSocket + UDP hole-punched transport for c3.
 // No DHT, no relays, no third-party discovery.
 // Frame: [u32 length][u8 type][payload]. JOIN/JOINOK carry a P-256
 // handshake; everything else is AES-256-GCM with the session key.
-// Transports are interchangeable: /ip4/h/tcp/p/p2p/id (TCP)
-// and /ip4/h/tcp/p/ws/p2p/id (WebSocket). ws is optional, loaded lazily.
+// Peers punch UDP on the same port number as TCP, so a pair that already
+// knows each other's address connects even when both firewalls deny inbound.
 import crypto from 'node:crypto'
 import net from 'node:net'
+import dgram from 'node:dgram'
 import os from 'node:os'
 import fs from 'node:fs'
 import * as Y from 'yjs'
@@ -19,6 +20,8 @@ const T_ADDRS = 6
 const MAX_FRAME = 64 << 20
 const CHUNK = 32 * 1024
 const MAX_ADDR = 12
+const UDP_TTL = 25000
+const NO_UDP = !!process.env.C3_NO_UDP
 const dbg = (...a) => { if (process.env.C3_DEBUG) console.error(...a) }
 const sha = b => crypto.createHash('sha256').update(b).digest()
 
@@ -111,40 +114,54 @@ const ecdh = () => {
   return e
 }
 
-// ---------- wire adapters: TCP socket and WS socket look the same ----------
+// ---------- punch packets: 24 bytes, HMAC-only, no per-packet IV ----------
+const P_MAGIC = Buffer.from('C3PU')
+const punchPacket = (key, ctr) => {
+  const b = Buffer.allocUnsafe(24)
+  P_MAGIC.copy(b, 0)
+  b.writeUInt32BE(ctr >>> 0, 4)
+  crypto.createHmac('sha256', key).update(b.subarray(0, 8)).digest().subarray(0, 16).copy(b, 8)
+  return b
+}
+const isPunch = d => d.length === 24 && d.subarray(0, 4).equals(P_MAGIC)
+const validPunch = (key, d) => {
+  const mac = crypto.createHmac('sha256', key).update(d.subarray(0, 8)).digest().subarray(0, 16)
+  return crypto.timingSafeEqual(mac, d.subarray(8, 24))
+}
+
+// ---------- wire adapters ----------
 const tcpWire = sock => {
   const h = { data: [], close: [], error: [] }
+  const w = {
+    destroyed: false,
+    kind: 'tcp',
+    remoteAddress: sock.remoteAddress || null,
+    write: b => { if (!w.destroyed) { try { sock.write(b) } catch {} } },
+    destroy: () => { w.destroyed = true; try { sock.destroy() } catch {} },
+    on: (ev, fn) => { (h[ev] ||= []).push(fn) }
+  }
   sock.on('data', d => { for (const fn of h.data) fn(d) })
-  sock.on('close', () => { wireRef.destroyed = true; for (const fn of h.close) fn() })
+  sock.on('close', () => { w.destroyed = true; for (const fn of h.close) fn() })
   sock.on('error', () => { for (const fn of h.error) fn() })
   sock.setNoDelay(true)
   sock.setKeepAlive(true, 10000)
-  const wireRef = {
-    destroyed: false,
-    kind: 'tcp',
-    write: b => { if (!wireRef.destroyed) { try { sock.write(b) } catch {} } },
-    destroy: () => { wireRef.destroyed = true; try { sock.destroy() } catch {} },
-    on: (ev, fn) => { (h[ev] ||= []).push(fn) }
-  }
-  return wireRef
+  return w
 }
 
 const wsWire = (ws, kind = 'ws') => {
   const h = { data: [], close: [], error: [] }
-  const wireRef = {
+  const w = {
     destroyed: false,
     kind,
-    write: b => { if (!wireRef.destroyed) { try { ws.send(b) } catch {} } },
-    destroy: () => {
-      wireRef.destroyed = true
-      try { ws.terminate ? ws.terminate() : ws.close() } catch {}
-    },
+    remoteAddress: null,
+    write: b => { if (!w.destroyed) { try { ws.send(b) } catch {} } },
+    destroy: () => { w.destroyed = true; try { ws.terminate ? ws.terminate() : ws.close() } catch {} },
     on: (ev, fn) => { (h[ev] ||= []).push(fn) }
   }
   ws.on('message', d => { for (const fn of h.data) fn(Buffer.from(d)) })
-  ws.on('close', () => { wireRef.destroyed = true; for (const fn of h.close) fn() })
+  ws.on('close', () => { w.destroyed = true; for (const fn of h.close) fn() })
   ws.on('error', () => { for (const fn of h.error) fn() })
-  return wireRef
+  return w
 }
 
 // ---------- mesh ----------
@@ -155,14 +172,22 @@ class Mesh {
     this.peerId = { toString: () => this.id }
     this.wantPort = Number(port) > 0 ? Number(port) : 0
     this.wantWs = Number(opts.wsPort) > 0 ? Number(opts.wsPort) : 0
+    this.wantUdp = !NO_UDP && opts.udp !== false
     this.port = this.wantPort
     this.wsPort = 0
+    this.udpPort = 0
     this.conns = new Set()
     this.events = new Map()
     this.session = null
     this.join = null
     this.advertise = ''
     this.stopped = false
+    this.punchKey = null
+    this.punchCtr = 0
+    this.punchTick = 0
+    this.udpTargets = new Map()
+    this.udpPeers = new Map()
+    this.punchReplies = new Map()
   }
 
   on(type, fn) {
@@ -181,23 +206,21 @@ class Mesh {
   addrsList(advertise) {
     const out = new Set()
     if (!this.port && !this.wsPort) return []
-    const push = (host, tcpPort, wsPort) => {
-      if (tcpPort) { const m = toMa(`${host}:${tcpPort}`, this.id); if (m) out.add(m) }
-      if (wsPort) { const m = toMa(`${host}:${wsPort}`, this.id, true); if (m) out.add(m) }
+    const push = host => {
+      if (this.port) { const m = toMa(`${host}:${this.port}`, this.id); if (m) out.add(m) }
+      if (this.wsPort) { const m = toMa(`${host}:${this.wsPort}`, this.id, true); if (m) out.add(m) }
     }
     for (const list of Object.values(os.networkInterfaces())) {
       for (const i of list || []) {
-        if (i.family !== 'IPv4' || i.internal) continue
-        if (!usableV4(i.address)) continue
-        push(i.address, this.port, this.wsPort)
+        if (i.family !== 'IPv4' || i.internal || !usableV4(i.address)) continue
+        push(i.address)
       }
     }
-    push('127.0.0.1', this.port, this.wsPort)
+    push('127.0.0.1')
     const ad = advertise || this.advertise
     if (ad) {
-      const hp = hpOf(ad) || { host: String(ad).replace(/:\d+$/, ''), port: this.port }
-      const hostPart = String(ad).match(/^\[([^\]]+)\]/)?.[1] || String(ad).split(':')[0]
-      push(hostPart || hp.host, this.port, this.wsPort)
+      const host = String(ad).match(/^\[([^\]]+)\]/)?.[1] || String(ad).split(':')[0]
+      if (host) push(host)
     }
     return [...out].slice(0, MAX_ADDR)
   }
@@ -206,9 +229,19 @@ class Mesh {
   getConnections() {
     return [...this.conns].filter(c => c.ready).map(c => ({ remotePeer: { toString: () => c.peerId || '?' } }))
   }
+  hasReliable(peerId) {
+    for (const c of this.conns) if (c.ready && !c.udp && c.peerId === peerId) return true
+    return false
+  }
+  addUdpTarget(host, port) {
+    if (!this.wantUdp || !host || !port) return
+    if (port === this.port && (host === '127.0.0.1' || host === 'localhost')) return
+    const k = `${host}:${port}`
+    if (this.udpTargets.size >= 32 || this.udpTargets.has(k)) return
+    this.udpTargets.set(k, { host, port })
+  }
 
   async start() {
-    // TCP
     this.server = net.createServer(sock => this.attach(tcpWire(sock), null))
     const listen = p => new Promise((res, rej) => {
       const onErr = e => { this.server.off('error', onErr); rej(e) }
@@ -223,12 +256,10 @@ class Mesh {
     this.port = this.server.address().port
     this.server.on('error', () => {})
 
-    // WebSocket (optional)
     if (this.wantWs) {
       const mod = await getWs()
-      if (!mod) {
-        console.error('! warning ws package missing -- WebSocket transport disabled (npm i ws)')
-      } else {
+      if (!mod) console.error('! warning ws package missing -- WebSocket transport disabled (npm i ws)')
+      else {
         try {
           this.wss = new mod.WebSocketServer({ port: this.wantWs, perMessageDeflate: false })
           this.wss.on('connection', ws => this.attach(wsWire(ws), null))
@@ -244,35 +275,129 @@ class Mesh {
         }
       }
     }
-    dbg('[net] listening tcp', this.port, 'ws', this.wsPort || 'off', 'id', this.id)
+
+    // UDP on the same port number: separate namespace from TCP
+    if (this.wantUdp) {
+      try {
+        this.udp = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+        this.udp.on('message', (d, r) => this.onUdp(d, r))
+        this.udp.on('error', e => dbg('[net] udp', e?.message || e))
+        await new Promise((res, rej) => {
+          const onErr = e => { this.udp.off('error', onErr); rej(e) }
+          this.udp.once('error', onErr)
+          this.udp.bind(this.port, () => { this.udp.off('error', onErr); res() })
+        })
+        this.udpPort = this.port
+        this.punchTimer = setInterval(() => this.tick(), 1000)
+        this.punchTimer.unref?.()
+      } catch (e) {
+        console.error(`! warning UDP bind on ${this.port} failed -- hole punching disabled`)
+        dbg('[net] udp bind', e?.message || e)
+        this.wantUdp = false
+      }
+    }
+    dbg('[net] listening tcp', this.port, 'ws', this.wsPort || 'off', 'udp', this.udpPort || 'off', 'id', this.id)
   }
 
   async stop() {
     this.stopped = true
+    clearInterval(this.punchTimer)
     try { this.server?.close() } catch {}
     try { this.wss?.close() } catch {}
+    try { this.udp?.close() } catch {}
     for (const c of this.conns) { try { c.sock.destroy() } catch {} }
     this.conns.clear()
+  }
+
+  sendPunch(host, port) {
+    if (!this.punchKey || !this.udp) return
+    this.punchCtr = (this.punchCtr + 1) >>> 0
+    try { this.udp.send(punchPacket(this.punchKey, this.punchCtr), port, host) } catch {}
+  }
+
+  tick() {
+    if (this.stopped || !this.punchKey) return
+    this.punchTick++
+    const now = Date.now()
+    // expired udp peers
+    for (const [k, p] of this.udpPeers) {
+      if (now - p.ts < UDP_TTL) continue
+      if (p.conn) { try { p.conn.sock.destroy() } catch {}; this.conns.delete(p.conn) }
+      this.udpPeers.delete(k)
+    }
+    if (this.udpPeers.size === 0 || this.punchTick % 5 === 0) {
+      for (const t of this.udpTargets.values()) this.sendPunch(t.host, t.port)
+      if (this.udpPeers.size) for (const p of this.udpPeers.values()) this.sendPunch(p.host, p.port)
+    }
+    if (this.punchReplies.size > 256) this.punchReplies.clear()
+  }
+
+  ensureUdp(host, port) {
+    const k = `${host}:${port}`
+    let p = this.udpPeers.get(k)
+    if (!p) {
+      p = { host, port, peerId: null, ts: Date.now(), conn: null }
+      this.udpPeers.set(k, p)
+    }
+    p.ts = Date.now()
+    if (!p.conn && this.session) {
+      const w = {
+        destroyed: false,
+        kind: 'udp',
+        remoteAddress: host,
+        write: b => { if (!w.destroyed) { try { this.udp.send(b, p.port, p.host) } catch {} } },
+        destroy: () => { w.destroyed = true },
+        on: () => {}
+      }
+      p.conn = { sock: w, hp: { host, port, ws: false }, peerId: null, ready: false, buf: Buffer.alloc(0), udp: true }
+      this.conns.add(p.conn)
+      this.sendHello(p.conn)
+    }
+    return p
+  }
+
+  onUdp(d, r) {
+    if (!this.punchKey) return
+    const now = Date.now()
+    if (isPunch(d)) {
+      if (!validPunch(this.punchKey, d)) return
+      const k = `${r.address}:${r.port}`
+      if (now - (this.punchReplies.get(k) || 0) > 300) {
+        this.punchReplies.set(k, now)
+        this.sendPunch(r.address, r.port)
+      }
+      if (this.session) this.ensureUdp(r.address, r.port)
+      return
+    }
+    if (d.length < 6) return
+    const len = d.readUInt32BE(0)
+    if (len !== d.length - 4 || d[4] < 1 || d[4] > 16) return
+    const p = this.ensureUdp(r.address, r.port)
+    p.ts = now
+    if (!p.conn) return
+    try { this.onFrame(p.conn, d[4], d.subarray(5)) } catch (e) { dbg('[net] udp frame', e?.message || e) }
   }
 
   async dial(ma) {
     try {
       const hp = hpOf(ma)
       if (!hp || this.stopped) return false
+      if (!hp.ws) this.addUdpTarget(hp.host, hp.port)
       if (!hp.ws && hp.port === this.port) return false
       if (hp.ws && hp.port === this.wsPort) return false
       for (const c of this.conns) {
         if (c.hp && c.hp.host === hp.host && c.hp.port === hp.port && c.hp.ws === hp.ws) return true
       }
-      let wire = null
-      try { wire = await connectWire(hp.host, hp.port, hp.ws, 6000) } catch { return false }
-      this.attach(wire, hp)
+      let w = null
+      try { w = await connectWire(hp.host, hp.port, hp.ws, 6000) } catch { return false }
+      this.attach(w, hp)
       return true
     } catch { return false }
   }
 
   attach(wire, hp) {
     if (this.stopped) { try { wire.destroy() } catch {}; return }
+    if (hp && !hp.ws) this.addUdpTarget(hp.host, hp.port)
     const conn = { sock: wire, hp, peerId: null, ready: false, buf: Buffer.alloc(0) }
     this.conns.add(conn)
     wire.on('data', d => this.onData(conn, d))
@@ -311,15 +436,15 @@ class Mesh {
       if (m.id === this.id) { try { conn.sock.destroy() } catch {}; return }
       if (conn.peerId && conn.peerId !== m.id) return
       conn.peerId = m.id
+      // one connection per peer per class: reliable and udp may coexist
       for (const other of this.conns) {
-        if (other !== conn && other.ready && other.peerId === m.id) {
-          try { conn.sock.destroy() } catch {}
-          return
-        }
+        if (other === conn || !other.ready || other.peerId !== m.id) continue
+        if (!!other.udp === !!conn.udp) { try { conn.sock.destroy() } catch {}; return }
       }
       if (!conn.ready) {
         conn.ready = true
-        dbg('[net] peer', m.id, 'on', conn.hp ? `${conn.hp.host}:${conn.hp.port}${conn.hp.ws ? ' ws' : ''}` : `inbound ${conn.sock.kind}`)
+        const how = conn.udp ? 'udp' : conn.hp ? `${conn.hp.host}:${conn.hp.port}${conn.hp.ws ? ' ws' : ''}` : 'inbound'
+        dbg('[net] peer', m.id, 'on', how)
         this.emit('peer:connect', { toString: () => m.id })
       }
       if (Array.isArray(m.addrs)) {
@@ -339,8 +464,22 @@ class Mesh {
     if (!this.session) return
     this.sendBytes(conn, seal(this.session.aes, type, payload))
   }
-  sendAll(type, payload, except) {
-    for (const c of this.conns) if (c !== except && c.ready) this.sendSealed(c, type, payload)
+  // repeat > 1 retransmits only on udp conns (datagrams are lossy)
+  sendAll(type, payload, except, repeat = 1) {
+    if (!this.session) return
+    let buf = null
+    for (const c of this.conns) {
+      if (c === except || !c.ready) continue
+      if (c.udp && this.hasReliable(c.peerId)) continue
+      buf = buf || seal(this.session.aes, type, payload)
+      this.sendBytes(c, buf)
+      if (c.udp && repeat > 1) {
+        for (let i = 1; i < repeat; i++) {
+          const t = setTimeout(() => this.sendBytes(c, buf), i * 250)
+          t.unref?.()
+        }
+      }
+    }
   }
   sendHello(conn) {
     if (!this.session) return
@@ -471,6 +610,7 @@ export async function joinCall(mesh, invite, wait = 8000) {
     const hp = hpOf(a)
     if (!hp) continue
     if (!usableV4(hp.host) && !hp.host.includes(':') && hp.host !== 'localhost') continue
+    if (!hp.ws) mesh.addUdpTarget(hp.host, hp.port)
     dbg('[net] join', hp.host, hp.port, hp.ws ? 'ws' : 'tcp')
     const res = await joinOnce(hp.host, hp.port, invite.t, wait, hp.ws)
     if (res) return { ok: 1, name: res.name, key: res.key }
@@ -483,10 +623,11 @@ export function sync(mesh, name, key, doc, advertise, onAddrs = () => {}) {
   const aes = Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key), Buffer.from('c3salt'), Buffer.from('c3msg'), 32))
   mesh.doc = doc
   mesh.session = { name, key, aes }
+  mesh.punchKey = aes
   if (advertise) mesh.advertise = advertise
   const parts = new Map()
   const seen = new Set()
-  const sendVec = () => mesh.sendAll(T_VECTOR, Buffer.from(Y.encodeStateVector(doc)))
+  const sendVec = () => mesh.sendAll(T_VECTOR, Buffer.from(Y.encodeStateVector(doc)), null, 2)
   const sendAddrs = () => mesh.sendAll(T_ADDRS, Buffer.from(JSON.stringify(mesh.addrsList(advertise))))
   dbg('[net] session', name, 'id', mesh.id)
 
@@ -501,7 +642,7 @@ export function sync(mesh, name, key, doc, advertise, onAddrs = () => {}) {
       id.copy(h, 1)
       h.writeUInt16BE(i, 9)
       h.writeUInt16BE(count, 11)
-      mesh.sendAll(T_UPDATE, Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]))
+      mesh.sendAll(T_UPDATE, Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]), null, 3)
     }
   }
 
@@ -531,7 +672,11 @@ export function sync(mesh, name, key, doc, advertise, onAddrs = () => {}) {
         if (seen.size > 2048) seen.clear()
         dbg('[net] recv update', full.length, 'bytes')
         try { Y.applyUpdate(doc, full, 'remote') } catch { return }
-        for (const c of mesh.conns) if (c !== conn && c.ready) mesh.sendSealed(c, T_UPDATE, payload)
+        for (const c of mesh.conns) {
+          if (c === conn || !c.ready) continue
+          if (c.udp && mesh.hasReliable(c.peerId)) continue
+          mesh.sendSealed(c, T_UPDATE, payload)
+        }
       }
       if (parts.size > 256) parts.clear()
     } else if (type === T_ADDRS) {
