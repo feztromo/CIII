@@ -4,12 +4,12 @@
 //   npm install
 //   node c3.js config
 //   node c3.js connect
-//   node c3.js invite
-//   node c3.js join "c3://join/..."
+//   node c3.js share            <- paste once to the other peer
+//   node c3.js peer "<ma>"      <- paste their share line here
 // No host. No DHT. No third-party relay. Every peer listens, dials, relays,
-// and holds a full replica. Invites carry a one-time token; the session key
-// travels only inside the token handshake. Payloads are AES-256-GCM with the
-// session key over plain TCP, or WebSocket when --ws is enabled.
+// and holds a full replica. First contact needs one pasted address per pair
+// (no firewall rules); after that peers punch UDP and reconnect on their own.
+// Payloads are AES-256-GCM with the session key over TCP, WebSocket, or UDP.
 // Node 22+.
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import net from 'node:net'
+import dgram from 'node:dgram'
 import { loadKey, makeNode, joinCall, joinResponder, sync, addrsOf, toMa, tokenKey, tokenTopic } from './net.js'
 
 const argv = process.argv.slice(2)
@@ -95,6 +96,22 @@ const readInvites = sdir => {
   } catch { return [] }
 }
 const writeInvites = (sdir, a) => { atomicWrite(invitesFile(sdir), JSON.stringify(a.slice(-32), null, 2)); chmod(invitesFile(sdir), 0o600) }
+const readIdentity = () => {
+  try { const j = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, 'identity.key'), 'utf8')); if (/^[0-9a-f]{16}$/.test(j.id)) return j } catch {}
+  return null
+}
+const lanAddrs = (id, port, ws) => {
+  const out = []
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const i of list || []) {
+      if (i.family !== 'IPv4' || i.internal || i.address.startsWith('169.254.')) continue
+      const ma = toMa(`${i.address}:${port}`, id)
+      if (ma) out.push(ma)
+      if (ws) { const mw = toMa(`${i.address}:${ws}`, id, true); if (mw) out.push(mw) }
+    }
+  }
+  return out
+}
 
 // ---------- ignores ----------
 const DEFAULT_IGNORE = ['.git', '.c3', 'node_modules', 'dist', 'build', 'out', '.env*', '*.pem', 'id_rsa*', '*.log', '.DS_Store', 'Thumbs.db', 'desktop.ini', '*.tmp', '*.tmp-*']
@@ -420,8 +437,9 @@ async function connect(invite) {
   if (wantWs && (!Number.isInteger(wantWs) || wantWs < 1 || wantWs > 65535)) die('Bad --ws port.')
   const advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
   if (advertise && !toMa(advertise, 'x')) die('--advertise must be host:port.')
+  const wantUdp = !has('no-udp') && cfg0.udp !== false
 
-  const n = await makeNode(ident, wantPort, { wsPort: wantWs })
+  const n = await makeNode(ident, wantPort, { wsPort: wantWs, udp: wantUdp })
   const port = n.port || wantPort
   const me = {
     name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'peer'),
@@ -432,6 +450,7 @@ async function connect(invite) {
   let peerTimer = null, snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null
   let started = false
   let watcher = null
+  const askedPeers = flagVals('peer').length > 0
   const peerCount = () => new Set(n.getConnections().map(c => c.remotePeer.toString())).size
   const addPeer = a => {
     if (!sdir) return
@@ -446,6 +465,8 @@ async function connect(invite) {
   }
   const dialPeers = () => {
     if (leaving) return
+    // pick up addresses added by `node c3.js peer ...` while running
+    for (const a of readPeers(sdir)) addPeer(a)
     const live = new Set(n.getConnections().map(c => c.remotePeer.toString()))
     let count = 0
     for (const a of peers) {
@@ -701,7 +722,7 @@ async function connect(invite) {
   const addrsFile = path.join(sdir, 'addrs.json')
   const writeAddrs = () => {
     try {
-      atomicWrite(addrsFile, JSON.stringify({ id: n.peerId.toString(), addrs: addrsOf(n, advertise), port, wsPort: n.wsPort || 0 }))
+      atomicWrite(addrsFile, JSON.stringify({ id: n.peerId.toString(), addrs: addrsOf(n, advertise), port, wsPort: n.wsPort || 0, udpPort: n.udpPort || 0 }))
       chmod(addrsFile, 0o600)
     } catch {}
   }
@@ -712,7 +733,8 @@ async function connect(invite) {
   dialTimer = setInterval(dialPeers, 10000)
   ui.set('looking for peers...')
   await sleep(PEER_WAIT_MS)
-  if (invite && files.size === 0) await waitFor(STATE_WAIT_MS, () => files.size > 0)
+  if ((invite || askedPeers || peerCount() > 0) && files.size === 0)
+    await waitFor(STATE_WAIT_MS, () => files.size > 0)
 
   if (restored && files.size > 0) {
     ui.say('Ready from local state.')
@@ -722,15 +744,21 @@ async function connect(invite) {
     ui.say(`Joined session with ${peerCount()} peer(s).`)
     reconcile()
     startScan()
-  } else if (invite && !has('seed')) {
-    ui.say('Joined an empty session. Pass --seed to publish this directory.')
+  } else if ((invite || askedPeers || peerCount() > 0) && !has('seed')) {
+    ui.say('No state from any peer yet -- keeping this directory as-is.')
+    ui.say('If this really is a new session, pass --seed to publish it.')
+    startScan()
   } else {
     seedFromDisk()
   }
 
   tick = setInterval(() => {
     const p = peerCount()
-    ui.set(`live - ${p} peer${p === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}${advertise ? ' - advertised' : ''}${n.wsPort ? ' - ws' : ''}`)
+    const tags = [backend.kind]
+    if (advertise) tags.push('advertised')
+    if (n.wsPort) tags.push('ws')
+    if (n.udpPort) tags.push('punch')
+    ui.set(`live - ${p} peer${p === 1 ? '' : 's'} - ${files.size} files - ${tags.join(' - ')}`)
   }, 2000)
   ui.say('Ready. Ctrl+C to leave.')
   const bye = () => { clearInterval(tick); clearInterval(dialTimer); clearInterval(addrsTimer); leave() }
@@ -782,7 +810,7 @@ async function configCmd() {
   if (!key) die('No key provided.')
   if (key.length < 20) ui.warn('low-entropy key -- prefer a generated one.')
   writeKey(sdir, key)
-  const port = Number(flag('port') ?? await ask('Listening TCP port', String(DEFAULT_PORT)))
+  const port = Number(flag('port') ?? await ask('Listening TCP/UDP port', String(DEFAULT_PORT)))
   if (!Number.isInteger(port) || port < 1 || port > 65535) die('Bad port.')
   const wsAns = String(flag('ws') ?? await ask('WebSocket port (blank = off, needs "npm i ws")', '')).trim()
   const wsPort = wsAns ? Number(wsAns) : 0
@@ -807,13 +835,14 @@ async function configCmd() {
   console.log(`Config written: ${CONFIG_FILE}`)
   console.log('Key and state stay inside the c3 folder (not pushed).')
   console.log('')
-  console.log('Start the session:')
+  console.log('Start the session on one machine:')
   console.log('  node c3.js connect')
-  console.log('Then mint an invite (share in chat):')
-  console.log(`  node c3.js invite --name "${name}"`)
   console.log('')
-  console.log('Peers join with double quotes (works in cmd and PowerShell):')
-  console.log('  node c3.js join "c3://join/..."')
+  console.log('Then swap addresses once (no firewall rules, no invites):')
+  console.log('  node c3.js share                 -> paste to the other peer')
+  console.log('  node c3.js peer "<their peer:>"  -> paste their line here')
+  console.log('')
+  console.log('Every later session is just `node c3.js connect` on both sides.')
   if (wsPort) console.log('WebSocket path is available at /c3 on port ' + wsPort + '.')
 }
 
@@ -826,7 +855,12 @@ function inviteCmd() {
   let addrs = []
   try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
   addrs = addrs.filter(a => typeof a === 'string' && /\/p2p\//.test(a)).slice(0, 12)
-  if (!addrs.length) die('No running endpoint. Start `node c3.js connect` first (and set "advertise" if needed).')
+  if (!addrs.length) {
+    const id = readIdentity()?.id
+    if (!id) die('No running endpoint. Start `node c3.js connect` first.')
+    addrs = lanAddrs(id, Number(cfg.port ?? DEFAULT_PORT), cfg.wsPort || 0).slice(0, 6)
+  }
+  if (!addrs.length) die('No endpoint known. Start `node c3.js connect` first (or set "advertise").')
   const ttl = Number(flag('ttl') ?? 24) * 3600000
   const uses = Number(flag('uses') ?? 1)
   const token = crypto.randomBytes(24).toString('base64url')
@@ -844,6 +878,50 @@ function inviteCmd() {
   console.log('')
   if (addrs.some(a => a.includes('/ws'))) console.log('Includes a WebSocket endpoint (needs "npm i ws" on the joining peer).')
   console.log('The token burns on use. The session key travels only inside the encrypted channel.')
+}
+
+// ---------- share / peer ----------
+function shareCmd() {
+  const cfg = readConfig() ?? die('No config. Run `c3 config`.')
+  const sdir = sdirOf(cfg.name)
+  const key = readKey(sdir) ?? die('No session key. Run `c3 config`.')
+  let addrs = []
+  try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
+  if (!addrs.length) {
+    const id = readIdentity()?.id ?? die('Run `node c3.js connect` once so this peer has an identity.')
+    addrs = lanAddrs(id, Number(cfg.port ?? DEFAULT_PORT), cfg.wsPort || 0)
+  }
+  addrs = addrs.filter(a => typeof a === 'string' && /\/p2p\//.test(a) && !a.includes('/ip4/127.0.0.1/')).slice(0, 4)
+  if (!addrs.length) die('No LAN address found. Start `node c3.js connect` and try again.')
+  ui.clear()
+  console.log(`Share for "${cfg.name}" -- paste this whole block to the other peer:`)
+  console.log('')
+  console.log(`  name: ${cfg.name}`)
+  console.log(`  key:  ${key}`)
+  addrs.forEach(a => console.log(`  peer: ${a}`))
+  console.log('')
+  console.log('They join with:')
+  console.log(`  node c3.js connect --name="${cfg.name}" --key="${key}" --peer="${addrs[0]}"`)
+  console.log('')
+  console.log('Then they run `node c3.js share` and you paste their "peer:" line into:')
+  console.log('  node c3.js peer "<their peer:>"')
+  console.log('')
+  console.log('No firewall rules needed: TCP fails, UDP punching takes over.')
+}
+
+function peerCmd() {
+  const cfg = readConfig() ?? die('No config. Run `c3 config`.')
+  const sdir = sdirOf(cfg.name)
+  const ma = String(argv[1] || '').trim()
+  if (!/^\/(ip4|ip6|dns)\/.+\/p2p\/[^/]+$/.test(ma)) {
+    die('usage: node c3.js peer "/ip4/10.49.96.41/tcp/8443/p2p/<peerid>"')
+  }
+  const list = readPeers(sdir)
+  if (!list.includes(ma)) list.push(ma)
+  atomicWrite(peersFile(sdir), JSON.stringify(list.slice(0, 64), null, 2))
+  chmod(peersFile(sdir), 0o600)
+  ui.say(`peer added: ${ma}`)
+  ui.say('A running `connect` picks it up within ~10s; TCP fails, UDP punching takes over.')
 }
 
 // ---------- export ----------
@@ -870,9 +948,19 @@ async function doctor() {
     if (!c) failed = true
     lines.push(`${c ? C.grn + '+' + C.r : C.red + '-' + C.r} ${n}${c ? '' : ' -- ' + hint}`)
   }
+  const tcpFree = p => new Promise(res => {
+    const s = net.createServer()
+    s.once('error', () => res(false))
+    s.listen(p, () => s.close(() => res(true)))
+  })
+  const udpFree = p => new Promise(res => {
+    const s = dgram.createSocket('udp4')
+    s.once('error', () => res(false))
+    s.bind(p, () => s.close(() => res(true)))
+  })
   ok('Node 22+', Number(process.version.slice(1).split('.')[0]) >= 22, 'upgrade Node')
   ok('project config', !!cfg, 'run `c3 config`')
-  ok('identity key', fs.existsSync(path.join(SESSION_DIR, 'identity.key')), 'run `connect` once')
+  ok('identity key', !!readIdentity(), 'run `connect` once')
   let isIgnored = false
   try { execFileSync('git', ['check-ignore', '-q', c3Name + '/'], { cwd: workDir, stdio: 'ignore' }); isIgnored = true } catch {}
   ok('c3 ignored by git', isIgnored, `add "${c3Name}/" to .gitignore`)
@@ -885,22 +973,18 @@ async function doctor() {
       const sdir = sdirOf(cfg.name)
       ok('session name present', !!cfg.name, 'run `c3 config`')
       ok('session key present', !!readKey(sdir), 'run `c3 config`')
-      const tryPort = async p => new Promise(res => {
-        const s = net.createServer()
-        s.once('error', () => res(false))
-        s.listen(p, () => s.close(() => res(true)))
-      })
       const port = Number(cfg.port ?? DEFAULT_PORT)
-      ok(`port ${port} bindable`, await tryPort(port), 'running connect may already hold it')
-      if (cfg.wsPort) ok(`ws port ${cfg.wsPort} bindable`, await tryPort(cfg.wsPort), 'running connect may already hold it')
+      ok(`tcp port ${port} bindable`, await tcpFree(port), 'running connect may already hold it')
+      ok(`udp port ${port} bindable`, await udpFree(port), 'something else holds UDP; punching disabled')
+      if (cfg.wsPort) ok(`ws port ${cfg.wsPort} bindable`, await tcpFree(cfg.wsPort), 'running connect may already hold it')
       let addrs = []
       try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
       ok('running endpoint known', addrs.length > 0, 'run `connect`, then `invite`')
-      ok('cached peers', readPeers(sdir).length > 0, 'join once, then peers are cached')
+      ok('cached peers', readPeers(sdir).length > 0, 'run `share`/`peer` once, then peers are cached')
     } catch (e) { ok('config valid', false, e.message) }
   }
-  lines.push(`${C.cyn}i${C.r} discovery: invite endpoints + cached peers`)
-  lines.push(`${C.cyn}i${C.r} transports: tcp${cfg?.wsPort ? ' + websocket' : ''} -- no DHT, no third-party relay`)
+  lines.push(`${C.cyn}i${C.r} discovery: pasted peers + cached multiaddrs (no DHT)`)
+  lines.push(`${C.cyn}i${C.r} transports: tcp${cfg?.wsPort ? ' + websocket' : ''} + udp punching`)
   ui.clear()
   console.log(lines.join('\n'))
   console.log(failed ? 'Some checks failed.' : 'All good.')
@@ -911,39 +995,44 @@ const usage = `usage: node c3.js <command> [flags]
 Commands:
   config    interactive wizard (once per project)
   connect   join/start live session
+  share     print name + key + this peer's addresses (paste once)
+  peer <ma> add a peer multiaddr (no restart needed)
   invite    mint a single-use invite link
   join <u>  join from an invite link
   export    copy tree to directory (save for backend "none")
-  doctor    diagnose config, key, port, reachability
+  doctor    diagnose config, key, ports, reachability
 Flags:
   --name <n>        session name
   --key <k>         session key
-  --peer <ma>       cached peer multiaddr (repeatable)
-  --port <n>        listening TCP port (default 8443)
+  --peer <ma>       peer multiaddr (repeatable)
+  --port <n>        listening TCP+UDP port (default 8443)
   --ws <port>       also listen for WebSocket peers (needs: npm i ws)
   --advertise <h:p> reachable endpoint shared with session peers
-  --seed            publish this directory into an empty joined session
+  --no-udp          disable UDP hole punching
+  --seed            publish this directory into an empty session
   --ttl <hours>     invite lifetime (default 24)
   --uses <n>        invite use count (default 1)
   --yes             auto-confirm publish
   --archive <type>  set backend (git | folder:<path> | none)
 How it works:
   No host, no DHT, no central service. Every peer is a full replica,
-  listener, dialer, and gossip relay. Peers meet through invite endpoints
-  and cached multiaddrs. First contact needs one out-of-band invite plus
-  one reachable peer; after that the group is self-describing. Payloads
-  use AES-256-GCM with the session key over plain TCP, or WebSocket when
-  --ws is enabled. Same session name + key = same room. On Windows cmd
-  use double quotes: node c3.js join "c3://join/..."
+  listener, dialer, and gossip relay. First contact needs one pasted
+  address per pair (share/peer or an invite); after that peers reconnect
+  and punch UDP through default-deny firewalls like ufw. Payloads use
+  AES-256-GCM with the session key. Same session name + key = same room.
+  On Windows cmd use double quotes: node c3.js join "c3://join/..."
 Config options (c3/.c3/config.json):
   "verify": "npm test"      run before publishing
   "forcePush": false        disable last-writer force push fallback
   "wsPort": 9443            default WebSocket port
+  "udp": false              disable UDP hole punching
   "advertise": "host:port"  reachable endpoint to share
 `
 loadIgnoreRules()
 if (cmd === 'config') await configCmd()
 else if (cmd === 'connect') await connect(null)
+else if (cmd === 'share') shareCmd()
+else if (cmd === 'peer') peerCmd()
 else if (cmd === 'invite') inviteCmd()
 else if (cmd === 'join') {
   const inv = parseInvite(argv[1])
