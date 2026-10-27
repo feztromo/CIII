@@ -17,7 +17,12 @@ import crypto from 'node:crypto'
 import { loadKey, makeNode, sync, toMa } from './net.js'
 
 const argv = process.argv.slice(2), cmd = argv[0]
-const flag = n => { const i = argv.indexOf('--' + n); return i >= 0 && argv[i+1] ? argv[i+1] : undefined }
+const flag = n => {
+  const i = argv.indexOf('--' + n)
+  if (i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--')) return argv[i + 1]
+  const eq = argv.find(a => a.startsWith('--' + n + '='))
+  return eq ? eq.slice(('--' + n + '=').length) : undefined
+}
 const has = n => argv.includes('--' + n)
 const IS_WIN = process.platform === 'win32'
 
