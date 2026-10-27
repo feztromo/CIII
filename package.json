@@ -6,18 +6,10 @@
   "scripts": {
     "config": "node c3.js config",
     "connect": "node c3.js connect",
-    "invite": "node c3.js invite",
-    "doctor": "node c3.js doctor"
+    "share": "node c3.js share",
+    "peer": "node c3.js peer"
   },
   "dependencies": {
-    "yjs": "^13.6.27",
-    "libp2p": "latest",
-    "@libp2p/tcp": "latest",
-    "@chainsafe/libp2p-noise": "latest",
-    "@chainsafe/libp2p-yamux": "latest",
-    "@libp2p/identify": "latest",
-    "@chainsafe/libp2p-gossipsub": "latest",
-    "@libp2p/crypto": "latest",
-    "@multiformats/multiaddr": "latest"
+    "yjs": "^13.6.27"
   }
 }
