@@ -1,29 +1,38 @@
 #!/usr/bin/env node
-// c3 -- P2P live session, single file. Node 22+, `yjs` is the only dependency.
-// Every peer listens, dials, and relays for the others (no host, no DHT).
-// First contact: one `share` / `peer` exchange. Afterwards peers retry
-// automatically and punch UDP through default-deny firewalls like ufw.
-//   node c3.js config
-//   node c3.js connect
-//   node c3.js share
-//   node c3.js peer "<their peer: line>"
+// c3 -- P2P live file session, single file. Node 22+, `yjs` is the only dependency.
+// Layout this is built for:
+//
+//   repo/                 <- ROOT is ALWAYS the folder that contains c3/
+//   ├── .git/             (the "trunk")
+//   ├── src/...
+//   └── c3/               <- this file, excluded from sync
+//       └── .c3/          <- state
+//
+// Lifecycle:
+//   peer 1  `node c3.js`               -> resets the tree to HEAD, seeds it, prints invite
+//   peer 2  `node c3.js join c3://...` -> adopts peer 1's live state
+//   ...they edit, changes flow both ways...
+//   peer 1  Ctrl+C                     -> "others still in session", no commit
+//   peer 2  Ctrl+C (last out)          -> commits + pushes the whole tree
+//
+// `node c3.js` alone RESUMES local state. Use `join` for a first contact.
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import net from 'node:net'
 import dgram from 'node:dgram'
 import crypto from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 // ---------- cli ----------
 const argv = process.argv.slice(2)
 const cmd = argv[0]
 const flag = n => {
   const i = argv.indexOf('--' + n)
-  if (i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--')) return argv[i + 1]
+  if (i >= 0 && argv[i + 1] !== undefined && !argv[i + 1].startsWith('--')) return argv[i + 1]
   const eq = argv.find(a => a.startsWith('--' + n + '='))
   return eq ? eq.slice(n.length + 3) : undefined
 }
@@ -41,142 +50,210 @@ const ui = {
 const dbg = (...a) => { if (process.env.C3_DEBUG) console.error(...a) }
 const die = m => { console.error(m); process.exit(1) }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
-const mkdirp = d => fs.mkdirSync(d, { recursive: true })
-const atomicWrite = (f, d) => {
+const mkdirp = (d, mode) => fs.mkdirSync(d, { recursive: true, ...(mode ? { mode } : {}) })
+const atomicWrite = (f, d, mode = 0o600) => {
   const t = f + '.tmp-' + process.pid + '-' + crypto.randomBytes(4).toString('hex')
-  fs.writeFileSync(t, d); fs.renameSync(t, f)
+  fs.writeFileSync(t, d, { mode })
+  fs.renameSync(t, f)
+  try { fs.chmodSync(f, mode) } catch {}
 }
 const chmod = (f, m) => { try { fs.chmodSync(f, m) } catch {} }
-const git = (...a) => execFileSync('git', a, { cwd: workDir, encoding: 'utf8', maxBuffer: 1 << 26 }).trim()
+const sigOf = st => st.mtimeMs + ':' + st.size
+const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+const GIT_TIMEOUT = 120000
+const git = (...a) => execFileSync('git', a, { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 28, timeout: GIT_TIMEOUT, env }).trim()
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
 
-// ---------- paths ----------
+// ---------- paths / root ----------
 const c3Dir = path.dirname(fileURLToPath(import.meta.url))
 const SESSION_DIR = path.join(c3Dir, '.c3')
 const CONFIG_FILE = path.join(SESSION_DIR, 'config.json')
-const workDir = path.resolve(c3Dir, '..')
-const c3Rel = path.relative(workDir, c3Dir).split(path.sep).join('/')
-const c3InsideWork = !c3Rel.startsWith('..') && !path.isAbsolute(c3Rel)
-const c3Name = path.basename(c3Dir)
-const DEFAULT_PORT = 8443
-const MAX_FILE = 16 << 20
-const MAX_FRAME = 32 << 20
-const CHUNK = 64 << 10
-const SEED_FILES = 10_000
-const SEED_BYTES = 200 << 20
-const WRITE_DEBOUNCE_MS = 40
-const SCAN_MS = 8000
-const PEER_WAIT_MS = 4000
-const STATE_WAIT_MS = 10000
+let ROOT = null, c3Rel = null, c3Inside = false
 const readConfig = () => { try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch { return null } }
 const sidOf = n => crypto.createHash('sha256').update('c3sid\0' + n).digest()
-const sdirOf = n => { const d = path.join(SESSION_DIR, 's', sidOf(n).toString('hex').slice(0, 32)); mkdirp(d); chmod(d, 0o700); return d }
+const sdirOf = n => { const d = path.join(SESSION_DIR, 's', sidOf(n).toString('hex').slice(0, 32)); mkdirp(d, 0o700); chmod(d, 0o700); return d }
 const readKey = s => { try { return fs.readFileSync(path.join(s, 'key'), 'utf8').trim() } catch { return null } }
-const writeKey = (s, k) => { atomicWrite(path.join(s, 'key'), k); chmod(path.join(s, 'key'), 0o600) }
+const writeKey = (s, k) => { atomicWrite(path.join(s, 'key'), k, 0o600) }
 const peersFile = s => path.join(s, 'peers.json')
 const readPeers = s => { try { const a = JSON.parse(fs.readFileSync(peersFile(s), 'utf8')); return Array.isArray(a) ? a.filter(x => typeof x === 'string' && x.length < 500).slice(0, 64) : [] } catch { return [] } }
-const writePeers = (s, a) => { atomicWrite(peersFile(s), JSON.stringify(a.slice(0, 64), null, 2)); chmod(peersFile(s), 0o600) }
+const writePeers = (s, a) => { atomicWrite(peersFile(s), JSON.stringify(a.slice(0, 64), null, 2), 0o600) }
+
+// ROOT is always the directory above c3/. No .git check, no cwd fallback.
+const defaultRoot = () => path.resolve(c3Dir, '..')
+const chooseRoot = () => flag('dir') ?? defaultRoot()
+
+function setRoot(dir) {
+  let real
+  try { real = fs.realpathSync(path.resolve(String(dir))) } catch { die('Directory not found: ' + dir) }
+  if (!fs.statSync(real).isDirectory()) die('Not a directory: ' + real)
+  if (real === path.parse(real).root) die('Refusing to use the filesystem root. Pass --dir <project>.')
+  let home = os.homedir()
+  try { home = fs.realpathSync(home) } catch {}
+  if (real === home) die('Refusing to sync your home directory. Pass --dir <project>.')
+  if (home.startsWith(real + path.sep)) die('Refusing to sync a directory that contains your home directory.')
+  ROOT = real
+  const r = path.relative(ROOT, c3Dir)
+  c3Inside = !!r && !r.startsWith('..') && !path.isAbsolute(r)
+  c3Rel = c3Inside ? r.split(path.sep).join('/') : null
+  mkdirp(SESSION_DIR, 0o700)
+}
 
 // ---------- identity ----------
 function loadIdentity() {
-  mkdirp(SESSION_DIR)
+  mkdirp(SESSION_DIR, 0o700)
   const f = path.join(SESSION_DIR, 'identity.json')
   try {
     const j = JSON.parse(fs.readFileSync(f, 'utf8'))
     if (/^[0-9a-f]{16}$/.test(j.id)) return j
   } catch {}
   const j = { id: crypto.randomBytes(8).toString('hex') }
-  atomicWrite(f, JSON.stringify(j)); chmod(f, 0o600)
+  atomicWrite(f, JSON.stringify(j), 0o600)
   return j
 }
 
-// ---------- addresses ----------
+// ---------- multiaddr ----------
 const toMa = (host, port, id) => {
-  const b = host.includes(':') ? '/ip6/' + host : (/^\d+\.\d+\.\d+\.\d+$/.test(host) ? '/ip4/' + host : '/dns/' + host)
-  return b + '/tcp/' + port + '/p2p/' + id
+  const k = net.isIPv6(host) ? 'ip6' : net.isIPv4(host) ? 'ip4' : 'dns'
+  return `/${k}/${host}/tcp/${port}/p2p/${id}`
 }
 const parseMa = s => {
-  const m = String(s || '').match(/^\/(ip4|ip6|dns)\/([^/]+)\/tcp\/(\d+)\/p2p\/([0-9a-f]{16})$/)
-  return m ? { host: m[2], port: Number(m[3]), id: m[4] } : null
+  const m = String(s || '').match(/^\/(ip4|ip6|dns)\/([^/]{1,255})\/tcp\/(\d{1,5})\/p2p\/([0-9a-f]{16})$/)
+  if (!m) return null
+  const kind = m[1]
+  const host = m[2].replace(/^\[/, '').replace(/\]$/, '')
+  const port = Number(m[3])
+  if (!(port > 0 && port < 65536)) return null
+  if (kind === 'ip4' && !net.isIPv4(host)) return null
+  if (kind === 'ip6' && !net.isIPv6(host)) return null
+  if (kind === 'dns' && !/^[a-z0-9]([a-z0-9.-]{0,252}[a-z0-9])?$/i.test(host)) return null
+  return { kind, host, port, id: m[4] }
 }
-const usableV4 = a => !a.startsWith('169.254.') && !a.startsWith('0.')
+const isLocalOnly = h => net.isIPv4(h)
+  ? /^(0\.|127\.|169\.254\.|22[4-9]\.|2[3-5]\d\.|255\.)/.test(h)
+  : net.isIPv6(h) ? /^(::1?$|fe80:|ff)/i.test(h) : false
+
 function lanAddrs(id, port) {
   const out = []
   if (!port) return out
   for (const list of Object.values(os.networkInterfaces())) {
     for (const i of list || []) {
-      if (i.family !== 'IPv4' || i.internal || !usableV4(i.address)) continue
+      if (i.family !== 'IPv4' || i.internal || isLocalOnly(i.address)) continue
       out.push(toMa(i.address, port, id))
     }
   }
-  out.push(toMa('127.0.0.1', port, id))
+  out.push(toMa('127.0.0.1', port, id))     // same-machine testing; peers ignore it
   return [...new Set(out)].slice(0, 16)
 }
 
+// ---------- invite ----------
+let JOIN = null
+const makeInvite = o => {
+  const j = JSON.stringify({ v: 1, n: o.name, k: o.key, h: o.host, p: o.port, i: o.id })
+  const sum = crypto.createHash('sha256').update(j).digest().subarray(0, 4).toString('base64url')
+  return 'c3://' + Buffer.from(j).toString('base64url') + '.' + sum
+}
+const readInvite = tok => {
+  const m = /^c3:\/\/([A-Za-z0-9_-]{16,8192})\.([A-Za-z0-9_-]{6})$/.exec(String(tok || '').trim())
+  if (!m) return null
+  let j, o
+  try { j = Buffer.from(m[1], 'base64url').toString('utf8'); o = JSON.parse(j) } catch { return null }
+  if (crypto.createHash('sha256').update(j).digest().subarray(0, 4).toString('base64url') !== m[2]) return null
+  if (o?.v !== 1 || typeof o.n !== 'string' || !o.n || o.n.length > 64) return null
+  if (typeof o.k !== 'string' || o.k.length < 8 || o.k.length > 512) return null
+  if (typeof o.h !== 'string' || !o.h || o.h.length > 255) return null
+  const port = Number(o.p)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+  if (!/^[0-9a-f]{16}$/.test(String(o.i || ''))) return null
+  const ma = toMa(o.h, port, o.i)
+  if (!parseMa(ma)) return null
+  return { name: o.n, key: o.k, host: o.h, port, id: o.i, ma }
+}
+const pickHost = addrs => {
+  const list = addrs.map(parseMa).filter(Boolean)
+  return list.find(p => !isLocalOnly(p.host)) || list.find(p => p.host === '127.0.0.1') || null
+}
+
 // ---------- wire ----------
-const T_AUTH = 1, T_AUTH_OK = 2, T_HELLO = 3, T_VECTOR = 4, T_UPDATE = 5, T_ADDRS = 6
+const T_AUTH = 1, T_AUTH_OK = 2, T_HELLO = 3, T_VECTOR = 4, T_UPDATE = 5, T_ADDRS = 6, T_PING = 7
+const MAX_FILE = 16 << 20
+const MAX_UPDATE = 32 << 20
+const MAX_FRAME = 2 << 20
+const CHUNK = 1200
+const MAX_CONNS = 64, MAX_CONNS_PER_IP = 8
+const HANDSHAKE_MS = 8000
+const MAGIC = Buffer.from('C3PU')
+
 const frame = (type, payload) => {
   const p = payload || Buffer.alloc(0)
-  const h = Buffer.allocUnsafe(5); h.writeUInt32BE(p.length + 1, 0); h[4] = type
+  const h = Buffer.allocUnsafe(5)
+  h.writeUInt32BE(p.length + 1, 0); h[4] = type
   return Buffer.concat([h, p])
 }
-const seal = (key, type, payload) => {
+const sealBody = (key, type, payload) => {
   const iv = crypto.randomBytes(12)
-  const c = crypto.createCipheriv('aes-256-gcm', key, iv); c.setAAD(Buffer.from([type]))
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv)
+  c.setAAD(Buffer.from([type]))
   const ct = Buffer.concat([c.update(payload || Buffer.alloc(0)), c.final()])
-  return frame(type, Buffer.concat([iv, ct, c.getAuthTag()]))
+  return Buffer.concat([iv, ct, c.getAuthTag()])
 }
 const unseal = (key, type, body) => {
-  if (body.length < 29) throw new Error('short frame')
+  if (body.length < 28) throw new Error('short frame')
   const d = crypto.createDecipheriv('aes-256-gcm', key, body.subarray(0, 12))
-  d.setAAD(Buffer.from([type])); d.setAuthTag(body.subarray(body.length - 16))
+  d.setAAD(Buffer.from([type]))
+  d.setAuthTag(body.subarray(body.length - 16))
   return Buffer.concat([d.update(body.subarray(12, body.length - 16)), d.final()])
 }
 
 // ---------- mesh ----------
 class Mesh {
-  constructor(ident, { port, psk, advertise, relay }) {
+  constructor(ident, { port, psk, advertise }) {
     this.id = ident.id
     this.peerId = { toString: () => this.id }
     this.wantPort = port
     this.port = 0
     this.psk = psk
     this.advertise = advertise
-    this.relay = relay
     this.conns = new Set()
     this.events = new Map()
     this.stopped = false
-    this.punchKey = null
-    this.punchCtr = 0
+    this.punchCtr = crypto.randomBytes(4).readUInt32BE(0)
     this.targets = new Map()
-    this.udpPeers = new Map()
+    this.peerAddr = new Map()
+    this.punchedAt = new Map()
     this.replied = new Map()
+    this.tags = new Map()
+    this.connIP = new Map()
+    this.cid = 0
   }
-  on(t, fn) { if (!this.events.has(t)) this.events.set(t, new Set()); this.events.get(t).add(fn); return () => this.events.get(t)?.delete(fn) }
+  on(t, fn) {
+    if (!this.events.has(t)) this.events.set(t, new Set())
+    this.events.get(t).add(fn)
+    return () => this.events.get(t)?.delete(fn)
+  }
   addEventListener(t, fn) { this.on(t, fn) }
   removeEventListener(t, fn) { this.events.get(t)?.delete(fn) }
   emit(t, detail) { for (const fn of this.events.get(t) || []) try { fn({ detail }) } catch (e) { dbg('[mesh] handler', e?.message) } }
+  peerIds() { const s = new Set(); for (const c of this.conns) if (c.ready && c.peerId) s.add(c.peerId); return s }
+  peerCount() { return this.peerIds().size }
+  getConnections() { return [...this.conns].filter(c => c.ready).map(c => ({ remotePeer: { toString: () => c.peerId } })) }
   addrs() {
     const out = lanAddrs(this.id, this.port)
-    if (this.advertise) {
-      const m = String(this.advertise).match(/^\[([^\]]+)\]:(\d+)$/) || String(this.advertise).match(/^([^:]+):(\d+)$/)
-      if (m && Number(m[2])) out.push(toMa(m[1], Number(m[2]), this.id))
+    const adv = String(this.advertise || '').trim()
+    if (adv) {
+      const m = adv.match(/^(?:\[([^\]]+)\]|([^:]+)):(\d+)$/)
+      if (m && Number(m[3]) > 0) out.push(toMa(m[1] || m[2], Number(m[3]), this.id))
     }
     return [...new Set(out)].slice(0, 16)
   }
-  getConnections() { return [...this.conns].filter(c => c.ready).map(c => ({ remotePeer: { toString: () => c.peerId } })) }
-  peerCount() { const s = new Set(); for (const c of this.conns) if (c.ready) s.add(c.peerId); return s.size }
 
   async start() {
-    this.server = net.createServer(sock => this.attach(sock, null))
+    this.server = net.createServer(s => this.accept(s))
     const listen = p => new Promise((res, rej) => {
       const onErr = e => { this.server.off('error', onErr); rej(e) }
       this.server.once('error', onErr)
       this.server.listen(p, () => { this.server.off('error', onErr); res() })
     })
-    try { await listen(this.wantPort) } catch {
-      dbg('[mesh] listen failed on', this.wantPort); await listen(0)
-    }
+    try { await listen(this.wantPort) } catch { dbg('[mesh] listen failed on', this.wantPort); await listen(0) }
     this.port = this.server.address().port
     this.server.on('error', () => {})
     try {
@@ -188,7 +265,8 @@ class Mesh {
         this.udp.once('error', onErr)
         this.udp.bind(this.port, () => { this.udp.off('error', onErr); res() })
       })
-      this.udpTimer = setInterval(() => this.tick(), 1000); this.udpTimer.unref?.()
+      this.udpTimer = setInterval(() => this.tick(), 1000)
+      this.udpTimer.unref?.()
     } catch { this.udp = null }
     dbg('[mesh] listening', this.port, 'udp', this.udp ? 'on' : 'off', 'id', this.id)
   }
@@ -197,179 +275,264 @@ class Mesh {
     clearInterval(this.udpTimer)
     try { this.server?.close() } catch {}
     try { this.udp?.close() } catch {}
-    for (const c of this.conns) try { c.sock.destroy() } catch {}
-    this.conns.clear()
+    for (const c of [...this.conns]) this.drop(c)
   }
 
-  // punching
-  addTarget(host, port) {
-    if (!this.udp || !port) return
-    if (host === '127.0.0.1' && port === this.port) return
-    if (this.targets.size >= 32) return
-    this.targets.set(host + ':' + port, { host, port })
-  }
-  punchPacket() {
-    const b = Buffer.allocUnsafe(24)
-    b.write('C3PU', 0, 'ascii')
-    b.writeUInt32BE(this.punchCtr++ >>> 0, 4)
-    crypto.createHmac('sha256', this.punchKey).update(b.subarray(0, 8)).digest().subarray(0, 16).copy(b, 8)
-    return b
-  }
-  validPunch(d) {
-    if (d.length !== 24 || d.toString('ascii', 0, 4) !== 'C3PU') return false
-    const m = crypto.createHmac('sha256', this.punchKey).update(d.subarray(0, 8)).digest().subarray(0, 16)
-    return crypto.timingSafeEqual(m, d.subarray(8, 24))
-  }
-  sendPunch(host, port) {
-    if (!this.punchKey || !this.udp) return
-    try { this.udp.send(this.punchPacket(), port, host) } catch {}
-  }
-  tick() {
-    if (!this.punchKey) return
-    const now = Date.now()
-    for (const t of this.targets.values()) this.sendPunch(t.host, t.port)
-    for (const p of this.udpPeers.values()) { this.sendPunch(p.host, p.port); if (now - p.ts > 25000) this.udpPeers.delete(p.host + ':' + p.port) }
-    if (this.replied.size > 512) this.replied.clear()
-  }
-  onUdp(d, r) {
-    if (!this.punchKey) return
-    const now = Date.now()
-    if (this.validPunch(d)) {
-      const k = r.address + ':' + r.port
-      if (!this.replied.has(k) || now - this.replied.get(k) > 500) {
-        this.replied.set(k, now); this.sendPunch(r.address, r.port)
-      }
+  // --- connection plumbing ---
+  accept(sock) {
+    const ip = sock.remoteAddress || '?'
+    if (this.conns.size >= MAX_CONNS || (this.connIP.get(ip) || 0) >= MAX_CONNS_PER_IP) {
+      try { sock.destroy() } catch {}
       return
     }
-    if (d.length < 6) return
-    const len = d.readUInt32BE(0)
-    if (len !== d.length - 4 || d[4] < 1 || d[4] > 30) return
-    const k = r.address + ':' + r.port
-    let p = this.udpPeers.get(k)
-    if (!p) {
-      p = { host: r.address, port: r.port, ts: now, conn: null }
-      this.udpPeers.set(k, p)
-      p.conn = this.newConn({ write: b => { try { this.udp.send(b, p.port, p.host) } catch {} }, destroy: () => {}, on: () => {} }, { host: r.address, port: r.port })
-      p.conn.key = Buffer.alloc(32)
-      this.sendHello(p.conn)
-    }
-    p.ts = now
-    try { this.onFrame(p.conn, d[4], d.subarray(5)) } catch (e) { dbg('[mesh] udp frame', e?.message) }
+    this.connIP.set(ip, (this.connIP.get(ip) || 0) + 1)
+    const c = this.newConn(sock, null)
+    c.dir = 'in'                      // responder: wait for the initiator's T_AUTH
+    c.timer = setTimeout(() => this.kill(c), HANDSHAKE_MS)
+    c.timer.unref?.()
   }
-
-  // connections
   newConn(sock, hp) {
-    const c = { sock, hp, key: null, peerId: null, ready: false, buf: Buffer.alloc(0), udp: !!hp && sock.on === undefined ? true : false }
-    sock.on('data', d => this.onData(c, d))
-    sock.on('close', () => { this.conns.delete(c); if (c.ready) this.emit('peer:disconnect', { toString: () => c.peerId }) })
-    sock.on('error', () => {})
+    const c = {
+      id: ++this.cid, sock, hp, dir: 'out', state: 'auth', rx: null, tx: null, tag: null,
+      ecdh: null, nonce: null, peerId: null, ready: false, udp: null, udpTs: 0, cands: [],
+      bufs: [], blen: 0, timer: null, ip: sock ? sock.remoteAddress : null, t: 0
+    }
+    if (sock) {
+      sock.setNoDelay?.(true); sock.setKeepAlive?.(true, 10000)
+      sock.on('data', d => this.feed(c, d))
+      sock.on('close', () => this.drop(c))
+      sock.on('error', () => {})
+    }
     this.conns.add(c)
     return c
   }
-  attach(sock, hp) {
-    sock.setNoDelay?.(true); sock.setKeepAlive?.(true, 10000)
-    const c = this.newConn(sock, hp)
-    this.startAuth(c, false)
+  kill(c) { try { c.sock?.destroy() } catch {} this.drop(c) }
+  drop(c) {
+    const was = c.ready, pid = c.peerId
+    c.ready = false
+    clearTimeout(c.timer); c.timer = null
+    if (c.tag) this.tags.delete(c.tag.toString('hex'))
+    if (c.ip) { const n = (this.connIP.get(c.ip) || 1) - 1; n > 0 ? this.connIP.set(c.ip, n) : this.connIP.delete(c.ip) }
+    this.conns.delete(c)
+    try { c.sock?.destroy() } catch {}
+    if (was && pid && ![...this.conns].some(o => o.ready && o.peerId === pid)) this.emit('peer:disconnect', pid)
   }
-  startAuth(c, outbound) {
-    c.ecdh = crypto.createECDH('prime256v1'); c.ecdh.generateKeys()
+  feed(c, d) {
+    c.bufs.push(d); c.blen += d.length
+    if (c.bufs.length > 1) { c.bufs = [Buffer.concat(c.bufs, c.blen)]; c.blen = c.bufs[0].length }
+    const b = c.bufs[0]
+    if (b.length < 4) return
+    const len = b.readUInt32BE(0)
+    if (len < 1 || len > MAX_FRAME) return this.kill(c)
+    if (b.length < 4 + len) return
+    let off = 0
+    while (off + 4 <= b.length) {
+      const l = b.readUInt32BE(off)
+      if (l < 1 || l > MAX_FRAME) return this.kill(c)
+      if (off + 4 + l > b.length) break
+      try { this.onFrame(c, b[off + 4], b.subarray(off + 5, off + 4 + l)) } catch (e) { dbg('[mesh] frame', e?.message); return this.kill(c) }
+      off += 4 + l
+    }
+    c.bufs = [b.subarray(off)]; c.blen = b.length - off
+  }
+
+  // --- handshake (ECDH over psk, per-direction keys) ---
+  proof(mode, pub, nonce) {
+    const mac = crypto.createHmac('sha256', this.psk)
+      .update(Buffer.concat([Buffer.from('c3auth\0'), Buffer.from([mode]), pub, nonce])).digest()
+    return Buffer.concat([Buffer.from([mode]), pub, nonce, mac])
+  }
+  derive(c, peerPub, peerNonce, saltParts) {
+    const shared = c.ecdh.computeSecret(peerPub)
+    const salt = crypto.createHash('sha256').update(Buffer.concat(saltParts)).digest()
+    const a = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('c3conn-a'), 32))
+    const b = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('c3conn-b'), 32))
+    c.tx = c.dir === 'out' ? a : b
+    c.rx = c.dir === 'out' ? b : a
+    c.tag = crypto.createHash('sha256').update(Buffer.concat([Buffer.from('c3udp\0'), a, b])).digest().subarray(0, 8)
+    this.tags.set(c.tag.toString('hex'), c)
+  }
+  startDial(c) {
+    c.ecdh = crypto.createECDH('prime256v1')
+    c.ecdh.generateKeys()
     c.nonce = crypto.randomBytes(16)
-    const mode = outbound ? 1 : 0
-    const proof = crypto.createHmac('sha256', this.psk).update(Buffer.concat([Buffer.from('c3auth\0'), Buffer.from([mode]), c.ecdh.getPublicKey(), c.nonce])).digest()
-    c.sock.write(frame(T_AUTH, Buffer.concat([Buffer.from([mode]), c.ecdh.getPublicKey(), c.nonce, proof])))
+    try { c.sock.write(frame(T_AUTH, this.proof(1, c.ecdh.getPublicKey(), c.nonce))) } catch { this.kill(c) }
   }
   onAuth(c, p) {
-    if (p[0] !== 1 || p.length !== 114) throw new Error('auth len')
-    const cpub = p.subarray(1, 66), cnonce = p.subarray(66, 82), proof = p.subarray(82, 114)
-    const exp = crypto.createHmac('sha256', this.psk).update(Buffer.concat([Buffer.from('c3auth\0'), Buffer.from([1]), cpub, cnonce])).digest()
-    if (!crypto.timingSafeEqual(proof, exp)) throw new Error('bad proof')
-    const shared = c.ecdh.computeSecret(cpub)
-    const salt = crypto.createHash('sha256').update(Buffer.concat([cpub, c.ecdh.getPublicKey(), cnonce, c.nonce])).digest()
-    c.key = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('c3conn'), 32))
-    const ok = crypto.createHmac('sha256', this.psk).update(Buffer.concat([Buffer.from('c3ok\0'), c.ecdh.getPublicKey(), c.nonce])).digest()
+    if (c.state !== 'auth' || c.dir !== 'in' || p.length !== 114 || p[0] !== 1) throw new Error('auth')
+    const pub = p.subarray(1, 66), nonce = p.subarray(66, 82), mac = p.subarray(82, 114)
+    const exp = crypto.createHmac('sha256', this.psk)
+      .update(Buffer.concat([Buffer.from('c3auth\0'), Buffer.from([1]), pub, nonce])).digest()
+    if (!crypto.timingSafeEqual(mac, exp)) throw new Error('bad proof')
+    c.ecdh = crypto.createECDH('prime256v1'); c.ecdh.generateKeys()
+    c.nonce = crypto.randomBytes(16)
+    this.derive(c, pub, nonce, [pub, c.ecdh.getPublicKey(), nonce, c.nonce])
+    const ok = crypto.createHmac('sha256', this.psk)
+      .update(Buffer.concat([Buffer.from('c3ok\0'), c.ecdh.getPublicKey(), c.nonce])).digest()
+    c.state = 'hello'
     c.sock.write(frame(T_AUTH_OK, Buffer.concat([c.ecdh.getPublicKey(), c.nonce, ok])))
-    c.sock.setTimeout?.(0)
+    if (c.timer) { clearTimeout(c.timer); c.timer = setTimeout(() => this.kill(c), HANDSHAKE_MS); c.timer.unref?.() }
     this.sendHello(c)
   }
   onAuthOk(c, p) {
-    if (p.length !== 113) throw new Error('auth ok len')
-    const spub = p.subarray(0, 65), snonce = p.subarray(65, 81), proof = p.subarray(81, 113)
-    const exp = crypto.createHmac('sha256', this.psk).update(Buffer.concat([Buffer.from('c3ok\0'), spub, snonce])).digest()
-    if (!crypto.timingSafeEqual(proof, exp)) throw new Error('bad ok')
-    const shared = c.ecdh.computeSecret(spub)
-    const salt = crypto.createHash('sha256').update(Buffer.concat([c.ecdh.getPublicKey(), spub, c.nonce, snonce])).digest()
-    c.key = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('c3conn'), 32))
-    c.sock.setTimeout?.(0)
+    if (c.state !== 'auth' || c.dir !== 'out' || p.length !== 113) throw new Error('auth ok')
+    const pub = p.subarray(0, 65), nonce = p.subarray(65, 81), mac = p.subarray(81, 113)
+    const exp = crypto.createHmac('sha256', this.psk)
+      .update(Buffer.concat([Buffer.from('c3ok\0'), pub, nonce])).digest()
+    if (!crypto.timingSafeEqual(mac, exp)) throw new Error('bad ok')
+    this.derive(c, pub, nonce, [c.ecdh.getPublicKey(), pub, c.nonce, nonce])
+    c.state = 'hello'
     this.sendHello(c)
   }
-  onData(c, d) {
-    c.buf = Buffer.concat([c.buf, d])
-    try {
-      while (c.buf.length >= 4) {
-        const len = c.buf.readUInt32BE(0)
-        if (len < 1 || len > MAX_FRAME) throw new Error('len')
-        if (c.buf.length < 4 + len) return
-        const body = c.buf.subarray(4, 4 + len)
-        c.buf = c.buf.subarray(4 + len)
-        this.onFrame(c, body[0], body.subarray(1))
-      }
-    } catch (e) { dbg('[mesh] frame', e?.message); try { c.sock.destroy() } catch {} }
+  sendHello(c) {
+    const h = JSON.stringify({ id: this.id, addrs: this.addrs() })
+    try { c.sock.write(frame(T_HELLO, sealBody(c.tx, T_HELLO, Buffer.from(h)))) } catch { this.kill(c) }
   }
   onFrame(c, type, body) {
     if (type === T_AUTH) return this.onAuth(c, body)
     if (type === T_AUTH_OK) return this.onAuthOk(c, body)
-    if (!c.key) throw new Error('unauth')
-    const plain = unseal(c.key, type, body)
-    if (type === T_HELLO) {
-      let h; try { h = JSON.parse(plain.toString('utf8')) } catch { return }
-      if (!h || typeof h.id !== 'string' || h.id === this.id) { try { c.sock.destroy() } catch {}; return }
-      if (c.peerId && c.peerId !== h.id) return
-      const first = !c.peerId
+    if (!c.rx) throw new Error('unauth')
+    const plain = unseal(c.rx, type, body)
+    if (c.state === 'hello') {
+      if (type !== T_HELLO) throw new Error('expected hello')
+      let h
+      try { h = JSON.parse(plain.toString('utf8')) } catch { throw new Error('bad hello') }
+      if (!h || typeof h.id !== 'string' || !/^[0-9a-f]{16}$/.test(h.id) || h.id === this.id) throw new Error('bad id')
+      if (c.hp?.id && h.id !== c.hp.id) throw new Error('peer id mismatch')
+
+      // two peers dialling each other at once: keep one live connection
+      const dup = [...this.conns].find(o => o !== c && o.ready && o.peerId === h.id)
+      if (dup) {
+        const [keep, dropit] = dup.id < c.id ? [dup, c] : [c, dup]
+        if (dropit === c) return this.kill(c)
+        this.drop(dropit)
+      }
+
       c.peerId = h.id
-      if (Array.isArray(h.addrs)) for (const a of h.addrs.slice(0, 16)) { const p = parseMa(a); if (p) this.addTarget(p.host, p.port) }
-      if (first) { c.ready = true; this.emit('peer:connect', { toString: () => h.id }) }
-      if (Array.isArray(h.addrs)) this.emit('addrs', h.addrs)
+      c.state = 'ready'
+      c.ready = true
+      clearTimeout(c.timer); c.timer = null
+      if (Array.isArray(h.addrs)) {
+        this.learnAddrs(h.id, h.addrs)
+        c.cands = h.addrs.slice(0, 8).map(parseMa)
+          .filter(a => a && a.id === h.id && !isLocalOnly(a.host) && a.kind !== 'ip6')
+          .map(a => ({ host: a.host, port: a.port }))
+      }
+      this.emit('peer:connect', h.id)
       return
     }
-    if (type === T_VECTOR || type === T_UPDATE || type === T_ADDRS) {
-      this.emit('message', { conn: c, type, payload: plain })
-      if (this.relay) for (const o of this.conns) {
-        if (o === c || !o.ready || o.peerId === c.peerId) continue
-        try { o.sock.write(frame(type, seal(o.key, type, plain))) } catch {}
-      }
-    }
+    if (!c.ready) throw new Error('not ready')
+    if (type === T_PING) return
+    if (type === T_VECTOR || type === T_UPDATE || type === T_ADDRS) return this.emit('message', { conn: c, type, payload: plain })
+    throw new Error('bad type')
   }
-  sendHello(c) {
-    const h = JSON.stringify({ id: this.id, addrs: this.addrs(), relay: this.relay, port: this.port })
-    try { c.sock.write(frame(T_HELLO, seal(c.key, T_HELLO, Buffer.from(h)))) } catch {}
-  }
-  sendAll(type, payload, except) {
-    for (const c of this.conns) {
-      if (c === except || !c.ready) continue
-      try { c.sock.write(frame(type, seal(c.key, type, payload))) } catch {}
+  learnAddrs(id, list) {
+    let n = 0
+    for (const raw of list.slice(0, 16)) {
+      const a = parseMa(raw)
+      if (!a || a.id !== id || a.id === this.id) continue
+      if (isLocalOnly(a.host)) continue
+      const k = a.host + ':' + a.port
+      this.peerAddr.set(k, id)
+      this.targets.set(k, { host: a.host, port: a.port })
+      if (++n >= 8) break
     }
+    while (this.targets.size > 32) this.targets.delete(this.targets.keys().next().value)
   }
   async dial(ma) {
     const a = parseMa(ma)
     if (!a || a.id === this.id || this.stopped) return false
     for (const c of this.conns) if (c.hp && c.hp.host === a.host && c.hp.port === a.port) return true
-    this.addTarget(a.host, a.port)
+    this.peerAddr.set(a.host + ':' + a.port, a.id)
+    this.targets.set(a.host + ':' + a.port, { host: a.host, port: a.port })
     return new Promise(res => {
+      let done = false
       const sock = net.connect({ host: a.host, port: a.port })
-      sock.setTimeout(6000, () => { try { sock.destroy() } catch {} })
+      const finish = ok => { if (!done) { done = true; res(ok) } }
+      sock.setTimeout(6000, () => { try { sock.destroy() } catch {}; finish(false) })
       sock.once('connect', () => {
         sock.setTimeout(0)
-        sock.setNoDelay(true); sock.setKeepAlive(true, 10000)
-        const c = this.newConn(sock, { host: a.host, port: a.port })
-        this.startAuth(c, true)
-        res(true)
+        const c = this.newConn(sock, a)
+        c.timer = setTimeout(() => this.kill(c), HANDSHAKE_MS); c.timer.unref?.()
+        this.startDial(c)
+        finish(true)
       })
-      sock.once('error', () => { try { sock.destroy() } catch {}; res(false) })
+      sock.once('error', () => { try { sock.destroy() } catch {}; finish(false) })
     })
+  }
+
+  // --- udp fast path (only after TCP auth) ---
+  punch(host, port) {
+    if (!this.udp || this.stopped) return
+    const b = Buffer.allocUnsafe(24)
+    MAGIC.copy(b, 0)
+    b.writeUInt32BE(this.punchCtr = (this.punchCtr + 1) >>> 0, 4)
+    crypto.createHmac('sha256', this.psk).update(b.subarray(0, 8)).digest().subarray(0, 16).copy(b, 8)
+    try { this.udp.send(b, port, host) } catch {}
+  }
+  validPunch(d) {
+    if (d.length !== 24 || d.toString('ascii', 0, 4) !== 'C3PU') return false
+    const mac = crypto.createHmac('sha256', this.psk).update(d.subarray(0, 8)).digest().subarray(0, 16)
+    return crypto.timingSafeEqual(mac, d.subarray(8, 24))
+  }
+  onUdp(d, r) {
+    const now = Date.now()
+    if (this.validPunch(d)) {
+      const k = r.address + ':' + r.port
+      this.punchedAt.set(k, now)
+      if (!this.replied.has(k) || now - this.replied.get(k) > 500) {
+        this.replied.set(k, now)
+        this.punch(r.address, r.port)      // reply only to a proven session member
+      }
+      if (this.replied.size > 512) this.replied.clear()
+      return
+    }
+    if (d.length < 6) return
+    const len = d.readUInt32BE(0)
+    if (len !== d.length - 4 || len < 1 + 8 + 28) return
+    const type = d[4]
+    if (type < T_HELLO || type > T_PING) return
+    const c = this.tags.get(d.subarray(5, 13).toString('hex'))
+    if (!c || !c.ready) return                  // no tag, no state, no reply
+    let plain
+    try { plain = unseal(c.rx, type, d.subarray(13)) } catch { return }
+    const k = r.address + ':' + r.port
+    if (c.udp && (c.udp.host !== r.address || c.udp.port !== r.port)) return
+    if (!c.udp) { c.udp = { host: r.address, port: r.port }; dbg('[mesh] udp path', k) }
+    c.udpTs = now
+    if (type === T_PING) return
+    if (type === T_VECTOR || type === T_UPDATE || type === T_ADDRS) this.emit('message', { conn: c, type, payload: plain })
+  }
+  tick() {
+    if (this.stopped) return
+    const now = Date.now()
+    for (const t of this.targets.values()) this.punch(t.host, t.port)
+    for (const [k, ts] of this.punchedAt) if (now - ts > 60000) this.punchedAt.delete(k)
+    for (const c of this.conns) {
+      if (!c.ready) continue
+      if (c.udp && now - c.udpTs > 15000) c.udp = null
+      if (c.udp || !this.udp || now - c.t < 2000) continue
+      c.t = now
+      const body = sealBody(c.tx, T_PING, Buffer.alloc(0))
+      const f = frame(T_PING, Buffer.concat([c.tag, body]))
+      for (const t of c.cands) { try { this.udp.send(f, t.port, t.host) } catch {} }
+    }
+  }
+
+  sendAll(type, payload, skip) {
+    for (const c of this.conns) {
+      if (!c.ready || c === skip) continue
+      let body
+      try { body = sealBody(c.tx, type, payload) } catch { continue }
+      if (c.sock && !c.sock.destroyed) { try { c.sock.write(frame(type, body)) } catch {} }
+      if (c.udp && this.udp) {
+        try { this.udp.send(frame(type, Buffer.concat([c.tag, body])), c.udp.port, c.udp.host) } catch {}
+      }
+    }
   }
 }
 
-// ---------- file mirror ----------
+// ---------- document + mirror ----------
 const doc = new Y.Doc()
 const files = doc.getMap('files')
 const texts = doc.getMap('texts')
@@ -379,15 +542,17 @@ const idToPath = new Map()
 const lastWritten = new Map()
 const diskMeta = new Map()
 const pendingWrites = new Map()
+const missing = new Map()
 const remote = tx => tx.origin !== 'disk' && tx.origin !== 'restore'
 const asBuf = u => Buffer.from(u.buffer, u.byteOffset, u.byteLength)
+let backend = null
 
 const DEFAULT_IGNORE = ['.git', '.c3', 'node_modules', 'dist', 'build', 'out', '.env*', '*.pem', 'id_rsa*', '*.log', '.DS_Store', 'Thumbs.db', 'desktop.ini', '*.tmp', '*.tmp-*']
 let customRules = []
 function loadIgnores() {
   let lines = []
   try { lines = fs.readFileSync(path.join(SESSION_DIR, 'ignore'), 'utf8').split(/\r?\n/) } catch {}
-  const res = [...DEFAULT_IGNORE, ...lines.map(l => l.trim()).filter(l => l && !l.startsWith('#'))]
+  customRules = [...DEFAULT_IGNORE, ...lines.map(l => l.trim()).filter(l => l && !l.startsWith('#'))]
     .map(p => {
       p = p.replace(/\/$/, '')
       let r = ''
@@ -399,127 +564,175 @@ function loadIgnores() {
       }
       return new RegExp('(^|/)' + r + '(/|$)')
     })
-  customRules = res
 }
-const ignoredCache = new Map()
-const isGitIgnored = rel => {
-  let v = ignoredCache.get(rel)
-  if (v === undefined) {
-    try { execFileSync('git', ['check-ignore', '-q', '--', rel], { cwd: workDir, stdio: 'ignore' }); v = true } catch { v = false }
-    if (ignoredCache.size > 50000) ignoredCache.clear()
-    ignoredCache.set(rel, v)
-  }
-  return v
-}
-let backend = null
 function shouldIgnore(rel) {
   if (!rel) return false
   rel = rel.split(path.sep).join('/')
   if (rel === '.git' || rel.startsWith('.git/')) return true
   if (rel === '.c3' || rel.startsWith('.c3/')) return true
-  if (c3InsideWork && (rel === c3Rel || rel.startsWith(c3Rel + '/'))) return true
+  if (c3Inside && (rel === c3Rel || rel.startsWith(c3Rel + '/'))) return true
   if (backend?.excluded && (rel === backend.excluded || rel.startsWith(backend.excluded + '/'))) return true
-  if (customRules.some(re => re.test(rel))) return true
-  if (backend?.kind === 'git' && isGitIgnored(rel)) return true
-  return false
+  return customRules.some(re => re.test(rel))
 }
-function safeRel(rel) {
-  if (typeof rel !== 'string' || rel === '') return null
-  const abs = path.resolve(workDir, rel)
-  if (abs !== workDir && !abs.startsWith(workDir + path.sep)) return null
-  const norm = path.relative(workDir, abs).split(path.sep).join('/')
-  if (norm === '.git' || norm.startsWith('.git/')) return null
-  if (c3InsideWork && (norm === c3Rel || norm.startsWith(c3Rel + '/'))) return null
-  if (backend?.excluded && (norm === backend.excluded || norm.startsWith(backend.excluded + '/'))) return null
-  return norm
-}
+
+// path safety: every mutation, including deletes, goes through this
+function inside(abs) { return abs === ROOT || abs.startsWith(ROOT + path.sep) }
 function symlinkEscape(abs) {
-  let cur = workDir
-  try { for (const part of path.relative(workDir, abs).split(path.sep)) { cur = path.join(cur, part); if (fs.lstatSync(cur).isSymbolicLink()) return true } } catch {}
+  let cur = ROOT
+  for (const part of path.relative(ROOT, abs).split(path.sep)) {
+    cur = path.join(cur, part)
+    let st
+    try { st = fs.lstatSync(cur) } catch { return false }
+    if (st.isSymbolicLink()) return true
+  }
   return false
 }
-function walkTree() {
+function safeAbs(rel) {
+  if (typeof rel !== 'string' || !rel || rel.length > 512 || rel.includes('\0')) return null
+  const abs = path.resolve(ROOT, rel)
+  if (!inside(abs) || abs === ROOT) return null
+  const norm = path.relative(ROOT, abs).split(path.sep).join('/')
+  if (norm !== rel.split(path.sep).join('/')) return null
+  return { abs, norm }
+}
+function dropFile(rel) {
+  const s = safeAbs(rel)
+  if (!s || symlinkEscape(s.abs)) return
+  try { fs.unlinkSync(s.abs) } catch {}
+}
+
+// tree listing: one git process per scan, never one per file
+function walkFs() {
   const out = []
   const walk = (abs, rel) => {
     let ents
     try { ents = fs.readdirSync(abs, { withFileTypes: true }) } catch { return }
     for (const e of ents) {
+      if (out.length > 50000) return
       const r = rel ? rel + '/' + e.name : e.name
       if (shouldIgnore(r)) continue
       if (e.isDirectory()) walk(path.join(abs, e.name), r)
       else if (e.isFile()) out.push(r)
     }
   }
-  walk(workDir, '')
+  walk(ROOT, '')
   return out
 }
+function walkTree() {
+  if (backend?.kind === 'git') {
+    let out
+    try { out = execFileSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: ROOT, encoding: 'buffer', maxBuffer: 1 << 28, timeout: GIT_TIMEOUT, env }) } catch { return walkFs() }
+    return out.toString('utf8').split('\0').filter(Boolean).filter(rel => !shouldIgnore(rel)).slice(0, 50000)
+  }
+  return walkFs()
+}
+
+const isHi = c => c >= 0xd800 && c <= 0xdbff
 function applyDiff(t, next) {
   const cur = t.toString()
   if (cur === next) return false
-  let s = 0; while (s < cur.length && s < next.length && cur[s] === next[s]) s++
-  let e = 0; while (e < cur.length - s && e < next.length - s && cur[cur.length - 1 - e] === next[next.length - 1 - e]) e++
+  let s = 0
+  while (s < cur.length && s < next.length && cur.charCodeAt(s) === next.charCodeAt(s)) s++
+  if (s > 0 && isHi(cur.charCodeAt(s - 1))) s--
+  let e = 0
+  while (e < cur.length - s && e < next.length - s &&
+    cur.charCodeAt(cur.length - 1 - e) === next.charCodeAt(next.length - 1 - e)) e++
+  if (e > 0 && isHi(cur.charCodeAt(cur.length - e - 1))) e--
   if (cur.length - s - e > 0) t.delete(s, cur.length - s - e)
   if (next.length - s - e > 0) t.insert(s, next.slice(s, next.length - e))
   return true
 }
 function syncFromDisk(rel, seed = false) {
-  const norm = safeRel(rel)
-  if (!norm || norm !== rel || shouldIgnore(norm)) return
+  const norm = safeAbs(rel)?.norm
+  if (!norm || shouldIgnore(norm)) return
   let data
-  try { data = fs.readFileSync(path.join(workDir, norm)) } catch { return }
-  if (data.length > MAX_FILE) { return }
+  try { data = fs.readFileSync(path.join(ROOT, norm)) } catch { return }
+  if (data.length > MAX_FILE) return
   const bin = data.includes(0)
   doc.transact(() => {
     const entry = files.get(norm)
     if (!entry) {
-      const id = crypto.randomUUID(); files.set(norm, { id, bin })
-      if (bin) blobs.set(id, new Uint8Array(data)); else texts.set(id, new Y.Text(data.toString('utf8')))
-      if (!seed) touched.add(norm); return
+      const id = crypto.randomUUID()
+      files.set(norm, { id, bin })
+      if (bin) blobs.set(id, new Uint8Array(data))
+      else texts.set(id, new Y.Text(data.toString('utf8')))
+      if (!seed) touched.add(norm)
+      return
     }
     if (entry.bin !== bin) {
       files.set(norm, { id: entry.id, bin })
-      if (bin) { texts.delete(entry.id); blobs.set(entry.id, new Uint8Array(data)) } else { blobs.delete(entry.id); texts.set(entry.id, new Y.Text(data.toString('utf8'))) }
-      if (!seed) touched.add(norm); return
+      if (bin) { texts.delete(entry.id); blobs.set(entry.id, new Uint8Array(data)) }
+      else { blobs.delete(entry.id); texts.set(entry.id, new Y.Text(data.toString('utf8'))) }
+      if (!seed) touched.add(norm)
+      return
     }
-    if (bin) { const cur = blobs.get(entry.id); if (!cur || Buffer.compare(asBuf(cur), data) !== 0) { blobs.set(entry.id, new Uint8Array(data)); if (!seed) touched.add(norm) } }
-    else { const t = texts.get(entry.id); if (t && applyDiff(t, data.toString('utf8')) && !seed) touched.add(norm) }
+    if (bin) {
+      const cur = blobs.get(entry.id)
+      if (!cur || Buffer.compare(asBuf(cur), data) !== 0) { blobs.set(entry.id, new Uint8Array(data)); if (!seed) touched.add(norm) }
+    } else {
+      const t = texts.get(entry.id)
+      if (t && applyDiff(t, data.toString('utf8')) && !seed) touched.add(norm)
+    }
   }, 'disk')
 }
 function removeFromDoc(rel) {
   doc.transact(() => {
-    const entry = files.get(rel); if (!entry) return
-    touched.add(rel); files.delete(rel); texts.delete(entry.id); blobs.delete(entry.id)
+    const entry = files.get(rel)
+    if (!entry) return
+    touched.add(rel)
+    files.delete(rel); texts.delete(entry.id); blobs.delete(entry.id)
   }, 'disk')
 }
 function writeToDisk(rawRel) {
-  const entry = files.get(rawRel); if (!entry) return
-  const rel = safeRel(rawRel); if (!rel || rel !== rawRel) return
-  if (shouldIgnore(rel)) return
-  const abs = path.join(workDir, rel)
-  if (symlinkEscape(abs)) return
+  const s = safeAbs(rawRel)
+  if (!s || shouldIgnore(s.norm) || symlinkEscape(s.abs)) return
+  const entry = files.get(s.norm)
+  if (!entry) return
   let data
-  if (entry.bin) { const b = blobs.get(entry.id); data = b ? asBuf(b) : Buffer.alloc(0) }
-  else data = Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
+  if (entry.bin) {
+    const b = blobs.get(entry.id)
+    if (!b) return
+    data = asBuf(b)
+  } else data = Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
   if (data.length > MAX_FILE) return
+  const abs = s.abs
   try {
-    if (fs.existsSync(abs) && Buffer.compare(fs.readFileSync(abs), data) === 0) return
-    mkdirp(path.dirname(abs)); atomicWrite(abs, data); lastWritten.set(rel, Date.now())
-    try { const st = fs.statSync(abs); diskMeta.set(rel, st.mtimeMs + ':' + st.size) } catch {}
+    const cur = fs.readFileSync(abs)
+    if (Buffer.compare(cur, data) === 0) return
+  } catch {}
+  let mode = 0o644
+  try { mode = fs.statSync(abs).mode & 0o777 } catch {}
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    atomicWrite(abs, data, mode)
+    lastWritten.set(s.norm, Date.now())
+    try { diskMeta.set(s.norm, sigOf(fs.statSync(abs))) } catch {}
   } catch {}
 }
-function scheduleWrite(rel) { clearTimeout(pendingWrites.get(rel)); pendingWrites.set(rel, setTimeout(() => { pendingWrites.delete(rel); writeToDisk(rel) }, WRITE_DEBOUNCE_MS)) }
-function flushWrites() { for (const [rel, t] of pendingWrites) { clearTimeout(t); writeToDisk(rel) } pendingWrites.clear() }
+function scheduleWrite(rel) {
+  clearTimeout(pendingWrites.get(rel))
+  pendingWrites.set(rel, setTimeout(() => { pendingWrites.delete(rel); writeToDisk(rel) }, 40))
+}
+function flushWrites() {
+  for (const [, t] of pendingWrites) clearTimeout(t)
+  pendingWrites.clear()
+  for (const rel of [...files.keys()]) writeToDisk(rel)
+}
+
 files.observe(ev => {
   for (const [key, change] of ev.keys) {
-    if (change.action === 'delete') { const o = change.oldValue; if (o?.id && idToPath.get(o.id) === key) idToPath.delete(o.id) }
-    else { const e = files.get(key); if (change.action === 'update' && change.oldValue?.id && change.oldValue.id !== e?.id) idToPath.delete(change.oldValue.id); if (e?.id) idToPath.set(e.id, key) }
+    const o = change.oldValue
+    if (o?.id && idToPath.get(o.id) === key) idToPath.delete(o.id)
+    const e = files.get(key)
+    if (change.action !== 'delete' && e?.id) idToPath.set(e.id, key)
   }
   if (!remote(ev.transaction)) return
   for (const [rawRel, change] of ev.keys) {
-    const rel = safeRel(rawRel); if (!rel || rel !== rawRel) continue
-    if (shouldIgnore(rel)) continue
-    if (change.action === 'delete') { touched.add(rel); fs.rmSync(path.join(workDir, rel), { force: true }) }
-    else { touched.add(rel); scheduleWrite(rawRel) }
+    const s = safeAbs(rawRel)
+    if (!s || shouldIgnore(s.norm)) continue
+    touched.add(s.norm)
+    if (change.action === 'delete') dropFile(s.norm)
+    else scheduleWrite(s.norm)
   }
 })
 const onContent = evs => {
@@ -531,150 +744,236 @@ const onContent = evs => {
 }
 texts.observeDeep(onContent)
 blobs.observeDeep(onContent)
-function reconcile() {
-  for (const rel of [...files.keys()]) writeToDisk(rel)
-  if (backend.kind === 'git' && files.size) {
-    const keep = new Set(files.keys())
-    for (const rel of walkTree()) if (!keep.has(rel)) fs.rmSync(path.join(workDir, rel), { force: true })
+
+// The session is the truth on join: delete local files it doesn't have,
+// then reconcile() writes everything it does have.
+function wipeLocal() {
+  const keep = new Set(files.keys())
+  for (const rel of walkTree()) {
+    if (keep.has(rel) || shouldIgnore(rel)) continue
+    dropFile(rel)
   }
+}
+function reconcile(prune) {
+  for (const rel of [...files.keys()]) writeToDisk(rel)
+  if (!prune) return
+  const keep = new Set(files.keys())
+  for (const rel of walkTree()) if (!keep.has(rel) && !shouldIgnore(rel)) dropFile(rel)
+}
+function adoptTree() {
+  for (const rel of walkTree()) { try { diskMeta.set(rel, sigOf(fs.statSync(path.join(ROOT, rel)))) } catch {} }
+}
+
+// Reset the working tree to HEAD: tracked files back to their committed
+// content, untracked non-ignored files removed. Ignored paths (node_modules,
+// c3/, .c3/) are untouched.
+function resetToHead() {
+  try { git('checkout', '--', '.') } catch (e) { ui.warn('checkout failed: ' + e.message); return }
+  if (gitOk('status', '--porcelain')) { try { git('clean', '-fd') } catch (e) { ui.warn('clean failed: ' + e.message) } }
 }
 
 // ---------- backend ----------
 function makeBackend(config) {
-  if (config.backend === 'git') {
-    return {
-      kind: 'git', excluded: null,
-      prepare() {
-        gitOk('fetch')
-        if (gitOk('rev-parse', '--abbrev-ref', 'HEAD') === 'HEAD')
-          for (const b of ['main', 'master']) if (gitOk('rev-parse', '--verify', '--quiet', 'refs/heads/' + b)) { try { git('checkout', b); break } catch {} }
-      },
-      generation: () => gitOk('rev-parse', 'HEAD') ?? 'no-head',
-      save(paths, meta) {
-        const list = [...paths]
-        for (let i = 0; i < list.length; i += 500) git('add', '-A', '--', ...list.slice(i, i + 500))
-        if (gitOk('status', '--porcelain') === '') return { saved: false }
-        const idc = gitOk('config', 'user.name') && gitOk('config', 'user.email') ? [] : ['-c', 'user.name=c3', '-c', 'user.email=c3@localhost']
-        git(...idc, 'commit', '-m', meta.message)
-        try { git('push'); return { saved: true, pushed: true } } catch {}
-        try { gitOk('fetch'); git('merge', '-X', 'ours', '--no-edit', '@{u}') } catch {
-          try { gitOk('merge', '--abort') } catch {}
-          if (config.forcePush !== false) { try { git('push', '--force'); return { saved: true, pushed: true, forced: true } } catch {} }
-          return { saved: true, pushed: false }
-        }
-        try { git('push'); return { saved: true, pushed: true } } catch { return { saved: true, pushed: false } }
+  if (config.backend !== 'git') return { kind: 'none', excluded: null, prepare() {}, generation: () => 'static', save: () => ({ saved: false, reason: 'no-git' }) }
+  return {
+    kind: 'git', excluded: null,
+    prepare() {
+      gitOk('fetch')
+      if (gitOk('rev-parse', '--abbrev-ref', 'HEAD') === 'HEAD')
+        for (const b of ['main', 'master'])
+          if (gitOk('rev-parse', '--verify', '--quiet', 'refs/heads/' + b)) { try { git('checkout', b); break } catch {} }
+    },
+    generation: () => gitOk('rev-parse', 'HEAD') ?? 'no-head',
+    save(paths, meta) {
+      const list = [...paths]
+      for (let i = 0; i < list.length; i += 500) {
+        try { git('add', '-A', '--', ...list.slice(i, i + 500)) } catch (e) { return { saved: false, reason: 'add-failed: ' + e.message } }
       }
+      if (gitOk('status', '--porcelain') === '') return { saved: false, reason: 'clean' }
+      const idc = gitOk('config', 'user.name') && gitOk('config', 'user.email') ? [] : ['-c', 'user.name=c3', '-c', 'user.email=c3@localhost']
+      try { git(...idc, 'commit', '-m', meta.message) } catch (e) { return { saved: false, reason: 'commit-failed: ' + e.message } }
+      try { git('push'); return { saved: true, pushed: true } } catch {}
+      try {
+        gitOk('fetch'); git('merge', '-X', 'ours', '--no-edit', '@{u}')
+      } catch {
+        try { gitOk('merge', '--abort') } catch {}
+        if (config.forcePush === true && has('force-push')) {
+          try { git('push', '--force'); return { saved: true, pushed: true, forced: true } } catch {}
+        }
+        return { saved: true, pushed: false }
+      }
+      try { git('push'); return { saved: true, pushed: true } } catch { return { saved: true, pushed: false } }
     }
   }
-  return { kind: 'none', excluded: null, prepare() {}, generation: () => 'static', save: () => ({ saved: false }) }
 }
 
 // ---------- sync ----------
 function sync(mesh, doc, onAddrs) {
-  if (!mesh.punchKey) return
-  const seen = new Set()
   const parts = new Map()
-  const aes = crypto.createHash('sha256').update('c3msg').update(mesh.psk).digest ? mesh.psk : mesh.psk
+  const seen = new Set()
+  let liveBytes = 0
   const sendVec = () => mesh.sendAll(T_VECTOR, Buffer.from(Y.encodeStateVector(doc)))
-  const sendAddrs = () => mesh.sendAll(T_ADDRS, Buffer.from(JSON.stringify(mesh.addrs())))
+  const sendAddrs = () => {
+    const peers = []
+    for (const c of mesh.conns) {
+      if (!c.ready || !c.peerId) continue
+      const a = (c.cands || []).map(t => toMa(t.host, t.port, c.peerId)).slice(0, 4)
+      if (a.length) peers.push(a)
+      if (peers.length >= 8) break
+    }
+    mesh.sendAll(T_ADDRS, Buffer.from(JSON.stringify({ self: mesh.addrs(), peers })))
+  }
   const sendUpd = u => {
     const data = Buffer.from(u)
+    if (!data.length || data.length > MAX_UPDATE) return
     const id = crypto.createHash('sha1').update(data).digest().subarray(0, 8)
-    const count = Math.max(1, Math.ceil(data.length / CHUNK))
-    for (let i = 0; i < count; i++) {
-      const h = Buffer.allocUnsafe(13); h[0] = T_UPDATE; id.copy(h, 1); h.writeUInt16BE(i, 9); h.writeUInt16BE(count, 11)
+    const n = Math.max(1, Math.ceil(data.length / CHUNK))
+    if (n > 65535) return
+    for (let i = 0; i < n; i++) {
+      const h = Buffer.allocUnsafe(13)
+      h[0] = T_UPDATE; id.copy(h, 1); h.writeUInt16BE(i, 9); h.writeUInt16BE(n, 11)
       mesh.sendAll(T_UPDATE, Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]))
     }
   }
+  const dropStale = () => {
+    const now = Date.now()
+    for (const [id, p] of parts) if (now - p.ts > 60000) { liveBytes -= p.bytes; parts.delete(id) }
+  }
   mesh.on('message', ev => {
-    const { conn, type, payload } = ev.detail || {}
-    if (!type || !payload) return
-    if (type === T_VECTOR) { const diff = Y.encodeStateAsUpdate(doc, payload); if (diff.length > 2) sendUpd(diff) }
-    else if (type === T_UPDATE) {
-      if (payload.length < 13) return
-      const id = payload.subarray(1, 9).toString('hex')
-      const i = payload.readUInt16BE(9), count = payload.readUInt16BE(11)
-      if (count < 1 || count > 4096 || i >= count) return
-      let e = parts.get(id); if (!e) { e = { count, got: 0, buf: [] }; parts.set(id, e) }
-      if (e.count !== count || e.buf[i]) return
-      e.buf[i] = Buffer.from(payload.subarray(13)); e.got++
-      if (e.got === e.count) {
-        parts.delete(id); const full = Buffer.concat(e.buf)
-        const h = crypto.createHash('sha1').update(full).digest('hex')
-        if (seen.has(h)) return; seen.add(h); if (seen.size > 2048) seen.clear()
-        try { Y.applyUpdate(doc, full, 'remote') } catch {}
-        for (const c of mesh.conns) if (c !== conn && c.ready) { try { c.sock.write(frame(T_UPDATE, seal(c.key, T_UPDATE, payload))) } catch {} }
-      }
-      if (parts.size > 256) parts.clear()
-    } else if (type === T_ADDRS) {
-      let a; try { a = JSON.parse(payload.toString('utf8')) } catch { return }
-      if (Array.isArray(a)) onAddrs(a.filter(x => typeof x === 'string' && /\/p2p\//.test(x)).slice(0, 16))
+    const { type, payload } = ev.detail || {}
+    if (!payload) return
+    if (type === T_VECTOR) {
+      const d = Y.encodeStateAsUpdate(doc, payload)
+      if (d.length > 2) sendUpd(d)
+      return
     }
+    if (type === T_ADDRS) {
+      let a
+      try { a = JSON.parse(payload.toString('utf8')) } catch { return }
+      const out = []
+      if (Array.isArray(a)) out.push(...a)
+      else if (a && typeof a === 'object') {
+        if (Array.isArray(a.self)) out.push(...a.self)
+        if (Array.isArray(a.peers)) for (const g of a.peers) if (Array.isArray(g)) out.push(...g)
+      }
+      onAddrs(out.slice(0, 32))
+      return
+    }
+    if (type !== T_UPDATE || payload.length < 15) return
+    const id = payload.subarray(1, 9).toString('hex')
+    const i = payload.readUInt16BE(9), n = payload.readUInt16BE(11)
+    if (n < 1 || i >= n || n > 65535) return
+    dropStale()
+    let p = parts.get(id)
+    if (!p) {
+      if (parts.size >= 64) return
+      p = { n, got: 0, ch: new Array(n), ts: 0, bytes: 0 }
+      parts.set(id, p)
+    }
+    if (p.n !== n || p.ch[i]) return
+    const c = Buffer.from(payload.subarray(13))
+    p.ch[i] = c; p.got++; p.bytes += c.length; p.ts = Date.now()
+    liveBytes += c.length
+    if (liveBytes > 64 << 20) { parts.clear(); liveBytes = 0; return }
+    if (p.got !== p.n) return
+    parts.delete(id); liveBytes -= p.bytes
+    const full = Buffer.concat(p.ch)
+    if (full.length < 2 || full.length > MAX_UPDATE) return
+    const digest = crypto.createHash('sha1').update(full).digest().subarray(0, 8).toString('hex')
+    if (digest !== id) return                              // integrity, as designed
+    if (seen.has(digest)) return
+    seen.add(digest); if (seen.size > 4096) seen.clear()
+    try { Y.applyUpdate(doc, full, 'remote') } catch {}
   })
   mesh.on('peer:connect', () => { sendVec(); sendAddrs() })
+  mesh.on('peer:disconnect', () => { parts.clear(); liveBytes = 0 })
   doc.on('update', (u, origin) => { if (origin !== 'remote' && origin !== 'restore') sendUpd(u) })
-  const t = setInterval(() => { sendVec(); sendAddrs() }, 8000); t.unref?.()
+  const t = setInterval(() => { sendVec(); sendAddrs() }, 8000)
+  t.unref?.()
   sendVec(); sendAddrs()
 }
 
 // ---------- connect ----------
 async function connect() {
   const cfg0 = readConfig() ?? {}
-  mkdirp(SESSION_DIR)
+  const dir = chooseRoot()
+  setRoot(dir)
   const ident = loadIdentity()
-  const name = flag('name') ?? cfg0.name ?? die('No session name. Run `c3 config`.')
+  const name = JOIN?.name ?? flag('name') ?? cfg0.name ?? path.basename(ROOT)
   const sdir = sdirOf(name)
-  const sKey = flag('key') ?? process.env.C3_KEY ?? readKey(sdir)
-  if (!sKey) die('No session key. Run `c3 config` or paste a share block.')
-  if (flag('key')) writeKey(sdir, sKey)
-  const wantPort = Number(flag('port') ?? cfg0.port ?? DEFAULT_PORT)
+  if (flag('key')) die('Use the invite line or C3_KEY (argv is visible in ps).')
+  let sKey = JOIN?.key ?? process.env.C3_KEY ?? readKey(sdir)
+  const fresh = !sKey
+  if (!sKey) sKey = crypto.randomBytes(32).toString('base64url')
+  if (fresh || JOIN) writeKey(sdir, sKey)
+  const wantPort = Number(flag('port') ?? cfg0.port ?? 8443)
+  if (!Number.isInteger(wantPort) || wantPort < 0 || wantPort > 65535) die('Bad port.')
   const advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
-  const wantRelay = has('relay') || cfg0.relay === true
   const psk = crypto.createHash('sha256').update('c3psk\0').update(name).update('\0').update(sKey).digest()
-  const mesh = new Mesh(ident, { port: wantPort, psk, advertise, relay: wantRelay })
-  mesh.punchKey = psk
+  const mesh = new Mesh(ident, { port: wantPort, psk, advertise })
   await mesh.start()
   const port = mesh.port
-  const me = { name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'peer') }
-  const cfg = { ...cfg0, name, port }
+  const kind = cfg0.backend === 'git' || cfg0.backend === 'none'
+    ? cfg0.backend
+    : (fs.existsSync(path.join(ROOT, '.git')) ? 'git' : 'none')
+  const cfg = { ...cfg0, name, port, backend: kind }      // dir is per-run, never stored
+  delete cfg.dir
   if (advertise) cfg.advertise = advertise
-  if (wantRelay) cfg.relay = true
-  if (!cfg.backend) cfg.backend = fs.existsSync(path.join(workDir, '.git')) ? 'git' : 'none'
-  atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2)); chmod(CONFIG_FILE, 0o600)
-  atomicWrite(path.join(sdir, 'name'), JSON.stringify({ name }))
+  atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2), 0o600)
   loadIgnores()
   backend = makeBackend(cfg)
   backend.prepare()
-  const peers = new Set()
-  for (const a of readPeers(sdir)) peers.add(a)
-  if (flag('peer')) peers.add(flag('peer'))
-  const askedPeers = flag('peer') !== undefined
-  let leaving = false, started = false, watcher = null
-  let peerTimer = null, snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null
+  const me = { name: gitOk('config', 'user.name') ?? (os.userInfo().username || 'peer') }
+  const prune = has('prune')
+
+  // A joiner starts from the peer's state, never from its own leftovers.
+  if (JOIN) {
+    for (const f of ['state.bin', 'state.gen', 'oplog']) { try { fs.rmSync(path.join(sdir, f), { force: true }) } catch {} }
+  }
+
+  // Starter: the repo is the trunk. Reset the working tree to HEAD before
+  // seeding, so first-run state is always "whatever is committed".
+  if (!JOIN && kind === 'git') {
+    ui.set('resetting to repo...')
+    resetToHead()
+  }
+
+  const peers = new Set(readPeers(sdir))
+  if (JOIN?.ma) peers.add(JOIN.ma)                       // pasted line: dial it right away
+  if (flag('peer')) { const p = parseMa(flag('peer')); if (p) peers.add(flag('peer')) }
+  writePeers(sdir, [...peers])
   const addPeer = a => {
-    if (typeof a !== 'string' || a.length > 500 || !/\/p2p\//.test(a)) return
-    if (a.includes('/p2p/' + mesh.id)) return
+    if (typeof a !== 'string' || a.length > 500) return
+    const p = parseMa(a)
+    if (!p || p.id === mesh.id || isLocalOnly(p.host)) return
     if (peers.has(a) || peers.size >= 64) return
     peers.add(a); writePeers(sdir, [...peers])
   }
+  let leaving = false
   const dialPeers = () => {
     if (leaving) return
     for (const a of readPeers(sdir)) if (!peers.has(a)) peers.add(a)
-    const live = new Set(mesh.getConnections().map(c => c.remotePeer.toString()))
+    const live = mesh.peerIds()
     let n = 0
     for (const a of peers) {
       if (n >= 8) break
-      const p = parseMa(a); if (!p || live.has(p.id)) continue
+      const p = parseMa(a)
+      if (!p || live.has(p.id)) continue
       mesh.dial(a).catch(() => {}); n++
     }
   }
-  const waitFor = async (ms, cond) => { const until = Date.now() + ms; while (Date.now() < until) { if (cond()) return true; await sleep(200) } return cond() }
+  const waitFor = async (ms, cond) => {
+    const until = Date.now() + ms
+    while (Date.now() < until) { if (cond()) return true; await sleep(200) }
+    return cond()
+  }
+
   // state
   const stateFile = path.join(sdir, 'state.bin')
   const genFile = path.join(sdir, 'state.gen')
   const logFile = path.join(sdir, 'oplog')
   const appendLog = u => { try { const h = Buffer.allocUnsafe(4); h.writeUInt32BE(u.length, 0); fs.appendFileSync(logFile, Buffer.concat([h, Buffer.from(u)])) } catch {} }
-  const snapshotNow = () => { try { atomicWrite(stateFile, Y.encodeStateAsUpdate(doc)); atomicWrite(genFile, backend.generation()); fs.rmSync(logFile, { force: true }) } catch {} }
+  const snapshotNow = () => { try { atomicWrite(stateFile, Y.encodeStateAsUpdate(doc), 0o600); atomicWrite(genFile, backend.generation(), 0o600); fs.rmSync(logFile, { force: true }) } catch {} }
   const scheduleSnapshot = () => { clearTimeout(snapTimer); snapTimer = setTimeout(snapshotNow, 5000) }
   const removeState = () => { for (const f of [stateFile, genFile, logFile]) { try { fs.rmSync(f, { force: true }) } catch {} } }
   function restoreState() {
@@ -684,209 +983,259 @@ async function connect() {
       if (g && g !== backend.generation()) { removeState(); return false }
       Y.applyUpdate(doc, fs.readFileSync(stateFile), 'restore')
       if (fs.existsSync(logFile)) {
-        const b = fs.readFileSync(logFile); let off = 0
-        while (off + 4 <= b.length) { const len = b.readUInt32BE(off); off += 4; if (len < 1 || len > MAX_FRAME || off + len > b.length) break; try { Y.applyUpdate(doc, b.subarray(off, off + len), 'restore') } catch {}; off += len }
+        const b = fs.readFileSync(logFile)
+        let off = 0
+        while (off + 4 <= b.length) {
+          const len = b.readUInt32BE(off); off += 4
+          if (len < 1 || len > MAX_FRAME || off + len > b.length) break
+          try { Y.applyUpdate(doc, b.subarray(off, off + len), 'restore') } catch {}
+          off += len
+        }
       }
-      for (const rel of files.keys()) touched.add(rel)
-      ui.say('Restored unsaved state from last run.'); return true
+      return true
     } catch { removeState(); return false }
   }
   const restored = restoreState()
+  if (restored && kind === 'git' && !JOIN) {
+    // resumed state older than HEAD: this machine has been reset underneath,
+    // so what is on disk is not what the session thinks it is.
+    const g = fs.existsSync(genFile) ? fs.readFileSync(genFile, 'utf8').trim() : null
+    if (g && g !== backend.generation()) {
+      ui.warn('local state is older than HEAD -- run `node c3.js join <invite>` to resync,')
+      ui.warn('or delete c3/.c3 and start over')
+    }
+  }
   sync(mesh, doc, addrs => { for (const a of addrs) addPeer(a); dialPeers() })
   doc.on('update', (u, origin) => { if (origin === 'restore') return; appendLog(u); scheduleSnapshot() })
+
   // scan
-  let lastGitignore = 0
   function scan() {
     try {
-      let m = 0; try { m = fs.statSync(path.join(workDir, '.gitignore')).mtimeMs } catch {}
-      if (m !== lastGitignore) { lastGitignore = m; ignoredCache.clear() }
-      const list = walkTree(); const present = new Set(list); const now = Date.now()
+      const list = walkTree()
+      const present = new Set(list)
+      const now = Date.now()
       for (const rel of list) {
-        if (pendingWrites.has(rel) || (lastWritten.get(rel) ?? 0) > now - 500) continue
-        let st; try { st = fs.statSync(path.join(workDir, rel)) } catch { continue }
-        const sig = st.mtimeMs + ':' + st.size; if (diskMeta.get(rel) === sig) continue
-        diskMeta.set(rel, sig); syncFromDisk(rel)
+        if (pendingWrites.has(rel) || (lastWritten.get(rel) ?? 0) > now - 1500) continue
+        let st
+        try { st = fs.statSync(path.join(ROOT, rel)) } catch { continue }
+        if (!st.isFile()) continue
+        const sig = sigOf(st)
+        if (diskMeta.get(rel) === sig) continue
+        diskMeta.set(rel, sig)
+        syncFromDisk(rel)
       }
-      for (const rel of [...files.keys()]) { if (present.has(rel) || pendingWrites.has(rel) || (lastWritten.get(rel) ?? 0) > now - 500) continue; removeFromDoc(rel) }
+      for (const rel of [...files.keys()]) {
+        if (present.has(rel)) { missing.delete(rel); continue }
+        if (shouldIgnore(rel) || pendingWrites.has(rel)) continue
+        if ((lastWritten.get(rel) ?? 0) > now - 3000) continue
+        const n = (missing.get(rel) || 0) + 1
+        if (n < 2) { missing.set(rel, n); continue }        // two strikes: ~16s
+        missing.delete(rel)
+        removeFromDoc(rel)
+      }
     } catch {}
   }
   function quick(rel) {
-    if (!rel) return; const now = Date.now(); if (pendingWrites.has(rel) || (lastWritten.get(rel) ?? 0) > now - 300) return
-    let st; try { st = fs.statSync(path.join(workDir, rel)) } catch { if (files.has(rel)) removeFromDoc(rel); return }
+    if (!rel) return
+    const s = safeAbs(rel)
+    if (!s || shouldIgnore(s.norm)) return
+    const now = Date.now()
+    if (pendingWrites.has(s.norm) || (lastWritten.get(s.norm) ?? 0) > now - 500) return
+    let st
+    try { st = fs.statSync(s.abs) } catch { return }        // transient; scan decides deletions
     if (!st.isFile()) return
-    const sig = st.mtimeMs + ':' + st.size; if (diskMeta.get(rel) === sig) return
-    diskMeta.set(rel, sig); syncFromDisk(rel)
+    const sig = sigOf(st)
+    if (diskMeta.get(s.norm) === sig) return
+    diskMeta.set(s.norm, sig)
+    syncFromDisk(s.norm)
   }
+  let started = false, watcher = null
   function startScan() {
-    if (started) return; started = true; scan()
+    if (started) return
+    started = true
+    scan()
     try {
-      watcher = fs.watch(workDir, { recursive: true }, (_e, f) => {
-        if (!f) return
-        const rel = String(f).split(path.sep).join('/')
-        if (!rel || rel === '.git' || rel.startsWith('.git/') || rel === '.c3' || rel.startsWith('.c3/')) return
-        if (c3InsideWork && (rel === c3Rel || rel.startsWith(c3Rel + '/'))) return
-        quick(rel)
-      })
+      watcher = fs.watch(ROOT, { recursive: true }, (_e, f) => { if (f) quick(String(f).split(path.sep).join('/')) })
       watcher.on('error', () => {})
     } catch { ui.warn('instant watching unavailable -- polling only') }
-    scanTimer = setInterval(scan, SCAN_MS)
+    scanTimer = setInterval(scan, 8000)
   }
   function seedFromDisk() {
-    const seed = walkTree(); let bytes = 0
-    for (const rel of seed) { try { bytes += fs.statSync(path.join(workDir, rel)).size } catch {} }
-    if (!cfg.forceSeed && (seed.length > SEED_FILES || bytes > SEED_BYTES)) die(`Refusing to seed ${seed.length} files / ${(bytes / 1e6).toFixed(0)} MB.`)
-    ui.say(`Seeding ${seed.length} files.`)
+    const seed = walkTree()
+    let bytes = 0
+    for (const rel of seed) { try { bytes += fs.statSync(path.join(ROOT, rel)).size } catch {} }
+    if (seed.length > 10000 || bytes > 200 << 20) die(`Refusing to seed ${seed.length} files / ${(bytes / 1e6).toFixed(0)} MB. Use --dir on a smaller tree.`)
     doc.transact(() => { for (const rel of seed) syncFromDisk(rel, true) }, 'disk')
     startScan()
   }
-  async function confirmSave() {
+
+  async function confirmSave(n) {
     if (has('yes')) return true
     if (!process.stdin.isTTY) return false
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-    const a = (await rl.question(`Publish ${touched.size} changed path(s) to archive? [y/N] `)).trim().toLowerCase()
+    const a = (await rl.question(`Publish ${n} changed path(s) to archive? [y/N] `)).trim().toLowerCase()
     rl.close(); return a === 'y' || a === 'yes'
   }
+  let snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null
   async function leave() {
-    if (leaving) return; leaving = true
-    clearInterval(scanTimer); clearTimeout(snapTimer); clearTimeout(peerTimer); clearInterval(tick); clearInterval(dialTimer); clearInterval(addrsTimer)
+    if (leaving) return
+    leaving = true
+    for (const t of [scanTimer, snapTimer, tick, dialTimer, addrsTimer]) { clearInterval(t); clearTimeout(t) }
     try { watcher?.close() } catch {}
     flushWrites(); snapshotNow(); ui.clear()
     try {
-      const others = mesh.peerCount()
-      if (others > 0) ui.say(`Others still in session (${others}) -- keeping local state.`)
-      else if (touched.size === 0) { ui.say('Nothing changed.'); removeState() }
-      else if (!(await confirmSave())) ui.say('Skipped publishing.')
-      else {
-        const r = backend.save(touched, { user: me.name, message: `Session snapshot ${new Date().toISOString()}` })
-        if (r.saved === false) { ui.say('Nothing changed.'); removeState() }
-        else if (r.pushed === false) ui.warn('Could not push -- commit kept locally.')
-        else { removeState(); ui.say(r.forced ? 'Saved and pushed (force).' : 'Saved and pushed.') }
+      if (mesh.peerCount() > 0) {
+        ui.say('others still in session -- keeping local state, not publishing')
+      } else {
+        const all = new Set(walkTree())
+        for (const rel of touched) all.add(rel)
+        const staged = backend.kind === 'git'
+          ? gitOk('status', '--porcelain') ?? ''
+          : ''
+        const n = Math.max(all.size, staged ? staged.split('\n').length : 0)
+        if (!(await confirmSave(n))) ui.say('skipped publishing')
+        else {
+          const r = backend.save(all, { user: me.name, message: `Session snapshot ${new Date().toISOString()}` })
+          if (r.saved === false) {
+            if (r.reason === 'no-git') ui.say(`nothing to publish: no git repo in ${ROOT}`)
+            else if (r.reason === 'clean') ui.say('nothing changed (already committed)')
+            else ui.warn('publish failed: ' + (r.reason || 'unknown'))
+            removeState()
+          } else if (r.pushed === false) ui.warn('could not push -- commit kept locally')
+          else { removeState(); ui.say(r.forced ? 'saved and pushed (force)' : 'saved and pushed') }
+        }
       }
     } catch (e) { console.error('Save failed:', e.message) }
     finally { try { await mesh.stop() } catch {}; process.exit(0) }
   }
-  mesh.addEventListener('peer:connect', ev => { const pid = ev.detail?.toString?.() ?? 'peer'; ui.say(`peer ${pid.slice(0, 8)} connected`); dialPeers() })
-  mesh.addEventListener('peer:disconnect', () => ui.set(`live - ${mesh.peerCount()} peer(s)`))
+
+  mesh.addEventListener('peer:connect', ev => {
+    ui.say(`peer ${String(ev.detail ?? '').slice(0, 8)} connected`)
+    dialPeers()
+  })
+  mesh.addEventListener('peer:disconnect', () => ui.set(`live -- ${mesh.peerCount()} peer(s)`))
+
   const addrsFile = path.join(sdir, 'addrs.json')
-  const writeAddrs = () => { try { atomicWrite(addrsFile, JSON.stringify({ id: mesh.id, addrs: mesh.addrs(), port })) } catch {} }
-  addrsTimer = setInterval(writeAddrs, 5000); writeAddrs()
+  const myAddrs = mesh.addrs()
+  const writeAddrs = () => {
+    try { atomicWrite(addrsFile, JSON.stringify({ id: mesh.id, addrs: myAddrs, port }), 0o600) } catch {}
+  }
+
+  ui.say(`root ${ROOT}${flag('dir') ? ' (--dir)' : ''} -- ${kind}`)
   dialPeers(); dialTimer = setInterval(dialPeers, 10000)
-  ui.set('looking for peers...')
-  await sleep(PEER_WAIT_MS)
-  if (askedPeers && files.size === 0) await waitFor(STATE_WAIT_MS, () => files.size > 0)
-  if (restored && files.size > 0) { ui.say('Ready from local state.'); reconcile(); startScan() }
-  else if (files.size > 0) { ui.say(`Joined session with ${mesh.peerCount()} peer(s).`); reconcile(); startScan() }
-  else if (askedPeers && !has('seed')) { ui.say('No state yet -- keeping directory as-is (pass --seed for a new session).'); startScan() }
-  else seedFromDisk()
+  ui.set(JOIN ? 'connecting...' : 'starting...')
+  if (JOIN) await waitFor(45000, () => files.size > 0)
+  else await sleep(2500)
+
+  const had = files.size
+  if (had > 0) {
+    if (JOIN) wipeLocal()          // joining: the session wins
+    adoptTree()
+    reconcile(prune)
+  } else if (JOIN) {
+    ui.warn('joined but received no state from the peer in 45s')
+    ui.warn('the peer must stay running until your file count matches theirs')
+    ui.say('leaving without touching local files')
+    try { await mesh.stop() } catch {}
+    process.exit(1)
+  } else seedFromDisk()
+  if (!started) startScan()
+
+  writeAddrs()
+  addrsTimer = setInterval(writeAddrs, 5000)
+  if (had > 0) ui.say(`${restored ? 'resumed' : 'joined'} "${name}" -- ${files.size} files -- ${mesh.peerCount()} peer(s) -- ${kind}`)
+  else ui.say(`started "${name}" -- ${files.size} files -- ${kind}`)
+
+  const host = pickHost(myAddrs)
+  if (host) {
+    console.log('')
+    console.log('  invite -- paste this into the other terminal:')
+    console.log('')
+    console.log('  node c3.js join ' + makeInvite({ name, key: sKey, host: host.host, port: host.port, id: mesh.id }))
+    console.log('')
+  } else ui.warn('no reachable address; run with --advertise <host:port>')
+
   tick = setInterval(() => {
     const p = mesh.peerCount()
-    ui.set(`live - ${p} peer${p === 1 ? '' : 's'} - ${files.size} files - ${backend.kind}${wantRelay ? ' - relay' : ''}`)
+    ui.set(`live -- ${p} peer${p === 1 ? '' : 's'} -- ${files.size} files -- ${kind}`)
   }, 2000)
-  ui.say('Ready. Ctrl+C to leave.')
   process.on('SIGINT', leave); process.on('SIGTERM', leave)
+}
+
+// ---------- join / share / peer ----------
+async function joinCmd() {
+  const inv = readInvite(argv[1] ?? flag('invite'))
+  if (!inv) die('Bad invite. Paste the whole line: node c3.js join c3://...')
+  JOIN = inv
+  await connect()
+}
+function shareCmd() {
+  const cfg = readConfig() ?? die('No session yet -- run `node c3.js` first.')
+  const sdir = sdirOf(cfg.name)
+  const key = readKey(sdir) ?? die('No key -- run `node c3.js` first.')
+  let addrs = []
+  try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
+  if (!addrs.length) addrs = lanAddrs(loadIdentity().id, Number(cfg.port || 8443))
+  const host = pickHost(addrs)
+  if (!host) die('No reachable address. Run with --advertise <host:port>.')
+  ui.clear()
+  console.log('\n  node c3.js join ' + makeInvite({ name: cfg.name, key, host: host.host, port: host.port, id: loadIdentity().id }) + '\n')
+}
+function peerCmd() {
+  const cfg = readConfig() ?? die('No config.')
+  const ma = String(argv[1] || '').trim()
+  if (!parseMa(ma)) die('usage: node c3.js peer "/ip4/10.0.0.5/tcp/8443/p2p/<16 hex>"')
+  const sdir = sdirOf(cfg.name)
+  const list = readPeers(sdir)
+  if (!list.includes(ma)) list.push(ma)
+  writePeers(sdir, list)
+  ui.say('peer added')
 }
 
 // ---------- config ----------
 async function configCmd() {
-  const isGit = fs.existsSync(path.join(workDir, '.git'))
+  const dir = chooseRoot()
+  setRoot(dir)
+  const isGit = fs.existsSync(path.join(ROOT, '.git'))
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
   const ask = async (q, def) => {
     if (!process.stdin.isTTY) return def
-    const a = (await rl.question(`${C.cyn}?${C.r} ${q}${def ? ` [${C.yel}${def}${C.r}]` : ''} `)).trim()
+    const a = (await rl.question(`? ${q}${def ? ` [${def}]` : ''} `)).trim()
     return a || def
   }
-  ui.clear(); console.log(`c3 config -- ${workDir}`)
-  const choice = await ask('Backend  1) git  2) none  Pick 1/2', isGit ? '1' : '2')
-  const kind = ({ '1': 'git', '2': 'none' })[choice] || choice
-  if (kind === 'git' && !isGit) die('No .git here.')
-  const name = flag('name') ?? await ask('Session name', path.basename(workDir))
-  if (!name) die('Session name required.')
-  const sdir = sdirOf(name)
-  let key = flag('key')
-  if (!key) {
-    const c = (await ask(`Session key: new / paste${readKey(sdir) ? ' / keep' : ''}`, 'new')).toLowerCase()
-    if (c === 'keep' && readKey(sdir)) key = readKey(sdir)
-    else if (c === 'paste') key = (await rl.question('Paste key: ')).trim()
-    else key = crypto.randomBytes(32).toString('base64url')
-  }
-  if (!key) die('No key.')
-  writeKey(sdir, key)
-  const port = Number(flag('port') ?? await ask('Listening TCP/UDP port', String(DEFAULT_PORT)))
+  ui.clear(); console.log(`c3 config -- ${ROOT}`)
+  const picked = await ask('Backend  1) git  2) none  Pick 1/2', isGit ? '1' : '2')
+  const kind = picked === '1' && isGit ? 'git' : 'none'
+  const port = Number(flag('port') ?? await ask('Listening TCP/UDP port', '8443'))
   if (!Number.isInteger(port) || port < 1 || port > 65535) die('Bad port.')
   const advertise = String(flag('advertise') ?? await ask('Reachable host:port (blank = LAN only)', '')).trim()
-  const cfg = { backend: kind, name, port }
+  const cfg = { ...(readConfig() ?? {}), backend: kind, port }
+  delete cfg.dir
   if (advertise) cfg.advertise = advertise
-  atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2)); chmod(CONFIG_FILE, 0o600)
-  atomicWrite(path.join(sdir, 'name'), JSON.stringify({ name }))
+  else delete cfg.advertise
+  atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2), 0o600)
   if (kind === 'git') {
-    const ex = path.join(workDir, '.git', 'info', 'exclude')
+    const ex = path.join(ROOT, '.git', 'info', 'exclude')
     mkdirp(path.dirname(ex))
     const cur = fs.existsSync(ex) ? fs.readFileSync(ex, 'utf8') : ''
-    if (!cur.split('\n').includes(c3Name + '/')) fs.appendFileSync(ex, '\n' + c3Name + '/\n')
+    if (!cur.split('\n').includes('.c3/')) fs.appendFileSync(ex, '\n.c3/\n')
   }
   rl.close(); ui.clear()
   console.log(`Config written: ${CONFIG_FILE}`)
-  console.log('Start:  node c3.js connect')
-  console.log('Then:   node c3.js share   (paste the block to the other peer)')
-}
-
-// ---------- share / peer ----------
-function shareCmd() {
-  const cfg = readConfig() ?? die('No config.')
-  const sdir = sdirOf(cfg.name)
-  const key = readKey(sdir) ?? die('No key.')
-  let addrs = []
-  try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
-  if (!addrs.length) {
-    const id = loadIdentity().id
-    addrs = lanAddrs(id, Number(cfg.port ?? DEFAULT_PORT))
-  }
-  addrs = addrs.filter(a => /\/p2p\//.test(a) && !a.includes('/ip4/127.0.0.1/')).slice(0, 4)
-  if (!addrs.length) die('No LAN address found. Start `connect` first.')
-  ui.clear()
-  console.log(`Share for "${cfg.name}" -- paste this block to the other peer:\n`)
-  console.log(`  name: ${cfg.name}`)
-  console.log(`  key:  ${key}`)
-  addrs.forEach(a => console.log(`  peer: ${a}`))
-  console.log('\nThey run:')
-  console.log(`  node c3.js connect --name="${cfg.name}" --key="${key}" --peer="${addrs[0]}"`)
-  console.log('\nThen they `share` and you paste their "peer:" line into:')
-  console.log('  node c3.js peer "<their peer:>"')
-  console.log('\nufw on = TCP drops; UDP punching takes over within a few seconds.')
-}
-function peerCmd() {
-  const cfg = readConfig() ?? die('No config.')
-  const sdir = sdirOf(cfg.name)
-  const ma = String(argv[1] || '').trim()
-  if (!/^\/(ip4|ip6|dns)\/.+\/p2p\/[0-9a-f]{16}$/.test(ma)) die('usage: node c3.js peer "/ip4/10.0.0.5/tcp/8443/p2p/<id>"')
-  const list = readPeers(sdir)
-  if (!list.includes(ma)) list.push(ma)
-  writePeers(sdir, list)
-  ui.say(`peer added: ${ma}`)
-  ui.say('A running `connect` picks it up in ~10s.')
 }
 
 // ---------- dispatch ----------
-const usage = `usage: node c3.js <command> [flags]
-Commands:
-  config    interactive setup
-  connect   join/start session
-  share     print name + key + addresses (paste once)
-  peer <ma> add a cached peer address
-Flags:
-  --name <n>    session name
-  --key <k>     session key
-  --peer <ma>   peer multiaddr
-  --port <n>    listening TCP/UDP port (default 8443)
-  --advertise   reachable host:port
-  --relay       forward frames for other peers (on by default in this build)
-  --seed        publish this directory into an empty session
-  --yes         auto-confirm publish
-Same session name + key = same room.
+const usage = `usage: node c3.js [command]
+  (no command)      resume this directory's session, or start one
+  join <c3://...>   adopt a session (use this for first contact)
+  share             print the invite line again
+  config            change port / backend / advertise
+  peer <ma>         add a peer address manually
+Flags: --dir <p>  --port <n>  --advertise <host:port>  --prune  --yes  --force-push
 `
-loadIgnores()
-if (cmd === 'config') await configCmd()
-else if (cmd === 'connect') await connect()
+if (cmd === 'join') await joinCmd()
 else if (cmd === 'share') shareCmd()
+else if (cmd === 'config') await configCmd()
 else if (cmd === 'peer') peerCmd()
+else if (cmd === undefined || cmd === 'connect') await connect()
 else die(usage)
