@@ -16,6 +16,11 @@
 //   peer 2  Ctrl+C (last out)          -> commits + pushes the whole tree
 //
 // `node c3.js` alone RESUMES local state. Use `join` for a first contact.
+//
+// Networking: addresses are multiaddrs, IPv4 and global IPv6 are both advertised.
+// A peer on a mobile hotspot (CGNAT) cannot be reached by a peer on campus Wi-Fi;
+// start the session on the peer that has a global IPv6 address. `--lan-only`
+// hides global addresses when you do not want an internet-facing listener.
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
 import { execFileSync } from 'node:child_process'
@@ -111,16 +116,58 @@ function loadIdentity() {
   return j
 }
 
+// ---------- addresses ----------
+const bareAddr = h => String(h ?? '').trim().replace(/^\[/, '').replace(/\]$/, '').split('%')[0]
+
+const isLocalOnly = h => {
+  const a = bareAddr(h)
+  if (net.isIPv4(a)) return /^(0\.|127\.|169\.254\.|22[4-9]\.|2[3-5]\d\.|255\.)/.test(a)
+  if (net.isIPv6(a)) {
+    const l = a.toLowerCase()
+    if (l === '::' || l === '::1' || l === '0:0:0:0:0:0:0:1') return true
+    if (/^fe[89ab]/.test(l)) return true          // fe80::/10 link-local
+    if (/^ff/.test(l)) return true                // multicast
+    if (/^::ffff:/.test(l)) return true           // v4-mapped
+    return false
+  }
+  return false
+}
+
+// globally routable IPv6: not loopback, not link-local, not ULA
+const isGlobal6 = h => {
+  const a = bareAddr(h)
+  if (!net.isIPv6(a) || isLocalOnly(a)) return false
+  if (/^f[cd]/.test(a.toLowerCase())) return false   // fc00::/7
+  return true
+}
+
+// public IPv4 -- 100.64/10 is carrier CGNAT and NOT reachable from outside
+const isPublic4 = h => {
+  const a = bareAddr(h)
+  if (!net.isIPv4(a)) return false
+  const [x, y] = a.split('.').map(Number)
+  if (x === 0 || x === 10 || x === 127) return false
+  if (x === 172 && y >= 16 && y <= 31) return false
+  if (x === 192 && y === 168) return false
+  if (x === 169 && y === 254) return false
+  if (x === 100 && y >= 64 && y <= 127) return false
+  if (x >= 224) return false
+  return true
+}
+
+const isDialable = p => !!p && (isGlobal6(p.host) || isPublic4(p.host) || p.kind === 'dns')
+
 // ---------- multiaddr ----------
 const toMa = (host, port, id) => {
-  const k = net.isIPv6(host) ? 'ip6' : net.isIPv4(host) ? 'ip4' : 'dns'
-  return `/${k}/${host}/tcp/${port}/p2p/${id}`
+  const h = bareAddr(host)
+  const k = net.isIPv6(h) ? 'ip6' : net.isIPv4(h) ? 'ip4' : 'dns'
+  return `/${k}/${h}/tcp/${port}/p2p/${id}`
 }
 const parseMa = s => {
   const m = String(s || '').match(/^\/(ip4|ip6|dns)\/([^/]{1,255})\/tcp\/(\d{1,5})\/p2p\/([0-9a-f]{16})$/)
   if (!m) return null
   const kind = m[1]
-  const host = m[2].replace(/^\[/, '').replace(/\]$/, '')
+  const host = bareAddr(m[2])
   const port = Number(m[3])
   if (!(port > 0 && port < 65536)) return null
   if (kind === 'ip4' && !net.isIPv4(host)) return null
@@ -128,32 +175,46 @@ const parseMa = s => {
   if (kind === 'dns' && !/^[a-z0-9]([a-z0-9.-]{0,252}[a-z0-9])?$/i.test(host)) return null
   return { kind, host, port, id: m[4] }
 }
-const isLocalOnly = h => net.isIPv4(h)
-  ? /^(0\.|127\.|169\.254\.|22[4-9]\.|2[3-5]\d\.|255\.)/.test(h)
-  : net.isIPv6(h) ? /^(::1?$|fe80:|ff)/i.test(h) : false
+
+const addrRank = p => {
+  if (!p) return 9
+  if (p.kind === 'ip6') return isGlobal6(p.host) ? 0 : 3       // global v6 wins
+  if (p.kind === 'ip4') return isPublic4(p.host) ? 1 : p.host === '127.0.0.1' ? 8 : 2
+  return 4
+}
 
 function lanAddrs(id, port) {
   const out = []
   if (!port) return out
   for (const list of Object.values(os.networkInterfaces())) {
     for (const i of list || []) {
-      if (i.family !== 'IPv4' || i.internal || isLocalOnly(i.address)) continue
-      out.push(toMa(i.address, port, id))
+      const a = bareAddr(i?.address || '')
+      if (!a || i.internal || isLocalOnly(a)) continue
+      const v4 = net.isIPv4(a), v6 = net.isIPv6(a)
+      if (!v4 && !v6) continue
+      if (v6 && !isGlobal6(a)) continue                    // drop ULA, mapped
+      out.push(toMa(a, port, id))
     }
   }
-  out.push(toMa('127.0.0.1', port, id))     // same-machine testing; peers ignore it
-  return [...new Set(out)].slice(0, 16)
+  out.push(toMa('127.0.0.1', port, id))                    // same-machine testing
+  const seen = new Set()
+  return out
+    .filter(m => { if (seen.has(m)) return false; seen.add(m); return true })
+    .map((m, i) => ({ m, i, r: addrRank(parseMa(m)) }))
+    .sort((a, b) => a.r - b.r || a.i - b.i)
+    .map(x => x.m)
+    .slice(0, 16)
 }
 
 // ---------- invite ----------
 let JOIN = null
 const makeInvite = o => {
-  const j = JSON.stringify({ v: 1, n: o.name, k: o.key, h: o.host, p: o.port, i: o.id })
+  const j = JSON.stringify({ v: 1, n: o.name, k: o.key, a: o.addrs, h: o.host, p: o.port, i: o.id })
   const sum = crypto.createHash('sha256').update(j).digest().subarray(0, 4).toString('base64url')
   return 'c3://' + Buffer.from(j).toString('base64url') + '.' + sum
 }
 const readInvite = tok => {
-  const m = /^c3:\/\/([A-Za-z0-9_-]{16,8192})\.([A-Za-z0-9_-]{6})$/.exec(String(tok || '').trim())
+  const m = /^c3:\/\/([A-Za-z0-9_-]{16,16384})\.([A-Za-z0-9_-]{6})$/.exec(String(tok || '').trim())
   if (!m) return null
   let j, o
   try { j = Buffer.from(m[1], 'base64url').toString('utf8'); o = JSON.parse(j) } catch { return null }
@@ -166,11 +227,20 @@ const readInvite = tok => {
   if (!/^[0-9a-f]{16}$/.test(String(o.i || ''))) return null
   const ma = toMa(o.h, port, o.i)
   if (!parseMa(ma)) return null
-  return { name: o.n, key: o.k, host: o.h, port, id: o.i, ma }
+  const addrs = []
+  if (Array.isArray(o.a)) {
+    for (const raw of o.a.slice(0, 16)) {
+      const p = parseMa(raw)
+      if (p && p.id === o.i) addrs.push(toMa(p.host, p.port, o.i))
+    }
+  }
+  return { name: o.n, key: o.k, host: o.h, port, id: o.i, ma, addrs }
 }
 const pickHost = addrs => {
-  const list = addrs.map(parseMa).filter(Boolean)
-  return list.find(p => !isLocalOnly(p.host)) || list.find(p => p.host === '127.0.0.1') || null
+  const list = (addrs || []).map(parseMa).filter(Boolean)
+  let best = null
+  for (const p of list) if (!best || addrRank(p) < addrRank(best)) best = p
+  return best
 }
 
 // ---------- wire ----------
@@ -178,7 +248,8 @@ const T_AUTH = 1, T_AUTH_OK = 2, T_HELLO = 3, T_VECTOR = 4, T_UPDATE = 5, T_ADDR
 const MAX_FILE = 16 << 20
 const MAX_UPDATE = 32 << 20
 const MAX_FRAME = 2 << 20
-const CHUNK = 1200
+const CHUNK = 32 << 10          // was 1200: ~27x fewer frames, seals, and syscalls
+const UDP_MAX = 1200            // only small frames go over UDP (no IP fragmentation)
 const MAX_CONNS = 64, MAX_CONNS_PER_IP = 8
 const HANDSHAKE_MS = 8000
 const MAGIC = Buffer.from('C3PU')
@@ -206,13 +277,14 @@ const unseal = (key, type, body) => {
 
 // ---------- mesh ----------
 class Mesh {
-  constructor(ident, { port, psk, advertise }) {
+  constructor(ident, { port, psk, advertise, lanOnly }) {
     this.id = ident.id
     this.peerId = { toString: () => this.id }
     this.wantPort = port
     this.port = 0
     this.psk = psk
     this.advertise = advertise
+    this.lanOnly = !!lanOnly
     this.conns = new Set()
     this.events = new Map()
     this.stopped = false
@@ -237,12 +309,13 @@ class Mesh {
   peerCount() { return this.peerIds().size }
   getConnections() { return [...this.conns].filter(c => c.ready).map(c => ({ remotePeer: { toString: () => c.peerId } })) }
   addrs() {
-    const out = lanAddrs(this.id, this.port)
+    let out = lanAddrs(this.id, this.port)
     const adv = String(this.advertise || '').trim()
     if (adv) {
-      const m = adv.match(/^(?:\[([^\]]+)\]|([^:]+)):(\d+)$/)
+      const m = adv.match(/^(?:\[([^\]]+)\]|([^:/]+)):(\d+)$/)
       if (m && Number(m[3]) > 0) out.push(toMa(m[1] || m[2], Number(m[3]), this.id))
     }
+    if (this.lanOnly) out = out.filter(m => !isDialable(parseMa(m)))
     return [...new Set(out)].slice(0, 16)
   }
 
@@ -295,7 +368,7 @@ class Mesh {
     const c = {
       id: ++this.cid, sock, hp, dir: 'out', state: 'auth', rx: null, tx: null, tag: null,
       ecdh: null, nonce: null, peerId: null, ready: false, udp: null, udpTs: 0, cands: [],
-      bufs: [], blen: 0, timer: null, ip: sock ? sock.remoteAddress : null, t: 0
+      rbuf: null, off: 0, timer: null, ip: sock ? sock.remoteAddress : null, t: 0
     }
     if (sock) {
       sock.setNoDelay?.(true); sock.setKeepAlive?.(true, 10000)
@@ -317,23 +390,22 @@ class Mesh {
     try { c.sock?.destroy() } catch {}
     if (was && pid && ![...this.conns].some(o => o.ready && o.peerId === pid)) this.emit('peer:disconnect', pid)
   }
+  // offset cursor instead of Buffer.concat per data event: no O(n^2) on big frames
   feed(c, d) {
-    c.bufs.push(d); c.blen += d.length
-    if (c.bufs.length > 1) { c.bufs = [Buffer.concat(c.bufs, c.blen)]; c.blen = c.bufs[0].length }
-    const b = c.bufs[0]
-    if (b.length < 4) return
-    const len = b.readUInt32BE(0)
-    if (len < 1 || len > MAX_FRAME) return this.kill(c)
-    if (b.length < 4 + len) return
-    let off = 0
-    while (off + 4 <= b.length) {
-      const l = b.readUInt32BE(off)
-      if (l < 1 || l > MAX_FRAME) return this.kill(c)
-      if (off + 4 + l > b.length) break
-      try { this.onFrame(c, b[off + 4], b.subarray(off + 5, off + 4 + l)) } catch (e) { dbg('[mesh] frame', e?.message); return this.kill(c) }
-      off += 4 + l
+    const prev = c.rbuf
+    if (!prev || c.off >= prev.length) { c.rbuf = d; c.off = 0 }
+    else { c.rbuf = Buffer.concat([prev.subarray(c.off), d]); c.off = 0 }
+    const b = c.rbuf
+    while (b.length - c.off >= 4) {
+      const len = b.readUInt32BE(c.off)
+      if (len < 1 || len > MAX_FRAME) return this.kill(c)
+      if (b.length - c.off < 4 + len) break
+      const type = b[c.off + 4]
+      try { this.onFrame(c, type, b.subarray(c.off + 5, c.off + 4 + len)) }
+      catch (e) { dbg('[mesh] frame', e?.message); return this.kill(c) }
+      c.off += 4 + len
     }
-    c.bufs = [b.subarray(off)]; c.blen = b.length - off
+    if (c.off >= b.length) { c.rbuf = null; c.off = 0 }
   }
 
   // --- handshake (ECDH over psk, per-direction keys) ---
@@ -415,7 +487,7 @@ class Mesh {
       if (Array.isArray(h.addrs)) {
         this.learnAddrs(h.id, h.addrs)
         c.cands = h.addrs.slice(0, 8).map(parseMa)
-          .filter(a => a && a.id === h.id && !isLocalOnly(a.host) && a.kind !== 'ip6')
+          .filter(a => a && a.id === h.id && !isLocalOnly(a.host) && a.kind === 'ip4')
           .map(a => ({ host: a.host, port: a.port }))
       }
       this.emit('peer:connect', h.id)
@@ -434,7 +506,7 @@ class Mesh {
       if (isLocalOnly(a.host)) continue
       const k = a.host + ':' + a.port
       this.peerAddr.set(k, id)
-      this.targets.set(k, { host: a.host, port: a.port })
+      if (a.kind === 'ip4') this.targets.set(k, { host: a.host, port: a.port })   // punching is v4 only
       if (++n >= 8) break
     }
     while (this.targets.size > 32) this.targets.delete(this.targets.keys().next().value)
@@ -444,7 +516,7 @@ class Mesh {
     if (!a || a.id === this.id || this.stopped) return false
     for (const c of this.conns) if (c.hp && c.hp.host === a.host && c.hp.port === a.port) return true
     this.peerAddr.set(a.host + ':' + a.port, a.id)
-    this.targets.set(a.host + ':' + a.port, { host: a.host, port: a.port })
+    if (a.kind === 'ip4') this.targets.set(a.host + ':' + a.port, { host: a.host, port: a.port })
     return new Promise(res => {
       let done = false
       const sock = net.connect({ host: a.host, port: a.port })
@@ -461,14 +533,14 @@ class Mesh {
     })
   }
 
-  // --- udp fast path (only after TCP auth) ---
+  // --- udp fast path (only after TCP auth, ipv4 only) ---
   punch(host, port) {
-    if (!this.udp || this.stopped) return
+    if (!this.udp || this.stopped || !net.isIPv4(host)) return
     const b = Buffer.allocUnsafe(24)
     MAGIC.copy(b, 0)
     b.writeUInt32BE(this.punchCtr = (this.punchCtr + 1) >>> 0, 4)
     crypto.createHmac('sha256', this.psk).update(b.subarray(0, 8)).digest().subarray(0, 16).copy(b, 8)
-    try { this.udp.send(b, port, host) } catch {}
+    try { this.udp.send(b, port, host, () => {}) } catch {}
   }
   validPunch(d) {
     if (d.length !== 24 || d.toString('ascii', 0, 4) !== 'C3PU') return false
@@ -515,7 +587,7 @@ class Mesh {
       c.t = now
       const body = sealBody(c.tx, T_PING, Buffer.alloc(0))
       const f = frame(T_PING, Buffer.concat([c.tag, body]))
-      for (const t of c.cands) { try { this.udp.send(f, t.port, t.host) } catch {} }
+      for (const t of c.cands) { try { this.udp.send(f, t.port, t.host, () => {}) } catch {} }
     }
   }
 
@@ -524,10 +596,31 @@ class Mesh {
       if (!c.ready || c === skip) continue
       let body
       try { body = sealBody(c.tx, type, payload) } catch { continue }
-      if (c.sock && !c.sock.destroyed) { try { c.sock.write(frame(type, body)) } catch {} }
-      if (c.udp && this.udp) {
-        try { this.udp.send(frame(type, Buffer.concat([c.tag, body])), c.udp.port, c.udp.host) } catch {}
+      const f = frame(type, body)
+      if (c.sock && !c.sock.destroyed) { try { c.sock.write(f) } catch {} }
+      if (c.udp && this.udp && f.length <= UDP_MAX) {
+        try { this.udp.send(frame(type, Buffer.concat([c.tag, body])), c.udp.port, c.udp.host, () => {}) } catch {}
       }
+    }
+  }
+  // one seal per chunk, one socket.write for the whole update
+  sendChunks(payloads, skip) {
+    const single = payloads.length === 1
+    for (const c of this.conns) {
+      if (!c.ready || c === skip) continue
+      const frames = []
+      let total = 0
+      for (const p of payloads) {
+        let body
+        try { body = sealBody(c.tx, T_UPDATE, p) } catch { continue }
+        const f = frame(T_UPDATE, body)
+        frames.push(f); total += f.length
+        if (single && c.udp && this.udp && f.length <= UDP_MAX) {
+          try { this.udp.send(frame(T_UPDATE, Buffer.concat([c.tag, body])), c.udp.port, c.udp.host, () => {}) } catch {}
+        }
+      }
+      if (!total || !c.sock || c.sock.destroyed) continue
+      try { c.sock.write(frames.length === 1 ? frames[0] : Buffer.concat(frames, total)) } catch {}
     }
   }
 }
@@ -829,11 +922,13 @@ function sync(mesh, doc, onAddrs) {
     const id = crypto.createHash('sha1').update(data).digest().subarray(0, 8)
     const n = Math.max(1, Math.ceil(data.length / CHUNK))
     if (n > 65535) return
+    const out = []
     for (let i = 0; i < n; i++) {
       const h = Buffer.allocUnsafe(13)
       h[0] = T_UPDATE; id.copy(h, 1); h.writeUInt16BE(i, 9); h.writeUInt16BE(n, 11)
-      mesh.sendAll(T_UPDATE, Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]))
+      out.push(Buffer.concat([h, data.subarray(i * CHUNK, (i + 1) * CHUNK)]))
     }
+    mesh.sendChunks(out)
   }
   const dropStale = () => {
     const now = Date.now()
@@ -910,7 +1005,7 @@ async function connect() {
   if (!Number.isInteger(wantPort) || wantPort < 0 || wantPort > 65535) die('Bad port.')
   const advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
   const psk = crypto.createHash('sha256').update('c3psk\0').update(name).update('\0').update(sKey).digest()
-  const mesh = new Mesh(ident, { port: wantPort, psk, advertise })
+  const mesh = new Mesh(ident, { port: wantPort, psk, advertise, lanOnly: has('lan-only') })
   await mesh.start()
   const port = mesh.port
   const kind = cfg0.backend === 'git' || cfg0.backend === 'none'
@@ -939,7 +1034,10 @@ async function connect() {
   }
 
   const peers = new Set(readPeers(sdir))
-  if (JOIN?.ma) peers.add(JOIN.ma)                       // pasted line: dial it right away
+  if (JOIN) {
+    for (const m of JOIN.addrs) peers.add(m)              // every candidate: dialled in parallel
+    if (JOIN.ma) peers.add(JOIN.ma)
+  }
   if (flag('peer')) { const p = parseMa(flag('peer')); if (p) peers.add(flag('peer')) }
   writePeers(sdir, [...peers])
   const addPeer = a => {
@@ -1121,6 +1219,15 @@ async function connect() {
     try { atomicWrite(addrsFile, JSON.stringify({ id: mesh.id, addrs: myAddrs, port }), 0o600) } catch {}
   }
 
+  // security: this listener is now reachable from the whole internet when the
+  // machine has a global IPv6 or public IPv4 address.
+  const routable = myAddrs.map(parseMa).filter(isDialable)
+  if (routable.length) {
+    ui.warn(`listening on a globally routable address (${routable[0].host}) port ${port}`)
+    ui.warn('the invite is the password -- share it over a private channel, per session')
+    if (!has('lan-only')) ui.say('use --lan-only to keep the listener off the public internet')
+  }
+
   ui.say(`root ${ROOT}${flag('dir') ? ' (--dir)' : ''} -- ${kind}`)
   dialPeers(); dialTimer = setInterval(dialPeers, 10000)
   ui.set(JOIN ? 'connecting...' : 'starting...')
@@ -1151,7 +1258,7 @@ async function connect() {
     console.log('')
     console.log('  invite -- paste this into the other terminal:')
     console.log('')
-    console.log('  node c3.js join ' + makeInvite({ name, key: sKey, host: host.host, port: host.port, id: mesh.id }))
+    console.log('  node c3.js join ' + makeInvite({ name, key: sKey, addrs: myAddrs, host: host.host, port: host.port, id: mesh.id }))
     console.log('')
   } else ui.warn('no reachable address; run with --advertise <host:port>')
 
@@ -1173,13 +1280,15 @@ function shareCmd() {
   const cfg = readConfig() ?? die('No session yet -- run `node c3.js` first.')
   const sdir = sdirOf(cfg.name)
   const key = readKey(sdir) ?? die('No key -- run `node c3.js` first.')
+  const me = loadIdentity().id
   let addrs = []
   try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
-  if (!addrs.length) addrs = lanAddrs(loadIdentity().id, Number(cfg.port || 8443))
+  addrs = addrs.map(parseMa).filter(p => p && p.id === me).map(p => toMa(p.host, p.port, me))
+  if (!addrs.length) addrs = lanAddrs(me, Number(cfg.port || 8443))
   const host = pickHost(addrs)
   if (!host) die('No reachable address. Run with --advertise <host:port>.')
   ui.clear()
-  console.log('\n  node c3.js join ' + makeInvite({ name: cfg.name, key, host: host.host, port: host.port, id: loadIdentity().id }) + '\n')
+  console.log('\n  node c3.js join ' + makeInvite({ name: cfg.name, key, addrs, host: host.host, port: host.port, id: me }) + '\n')
 }
 function peerCmd() {
   const cfg = readConfig() ?? die('No config.')
@@ -1231,7 +1340,7 @@ const usage = `usage: node c3.js [command]
   share             print the invite line again
   config            change port / backend / advertise
   peer <ma>         add a peer address manually
-Flags: --dir <p>  --port <n>  --advertise <host:port>  --prune  --yes  --force-push
+Flags: --dir <p>  --port <n>  --advertise <host:port>  --lan-only  --prune  --yes  --force-push
 `
 if (cmd === 'join') await joinCmd()
 else if (cmd === 'share') shareCmd()
