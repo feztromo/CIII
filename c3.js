@@ -17,10 +17,12 @@
 //
 // `node c3.js` alone RESUMES local state. Use `join` for a first contact.
 //
-// Networking: addresses are multiaddrs, IPv4 and global IPv6 are both advertised.
-// A peer on a mobile hotspot (CGNAT) cannot be reached by a peer on campus Wi-Fi;
-// start the session on the peer that has a global IPv6 address. `--lan-only`
-// hides global addresses when you do not want an internet-facing listener.
+// Networking: addresses are multiaddrs. IPv4 and global IPv6 are both advertised.
+// A peer behind carrier NAT (phone hotspot) or on a NAT'd campus network cannot be
+// dialled from another network -- c3 says so at startup instead of letting the other
+// side hang for 45s. Start the session from the peer that has a global IPv6 or a
+// public IPv4. `--lan-only` hides global addresses; `--all-ifaces` also advertises
+// virtual adapters (VMware, docker, ...).
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
 import { execFileSync } from 'node:child_process'
@@ -141,7 +143,15 @@ const isGlobal6 = h => {
   return true
 }
 
-// public IPv4 -- 100.64/10 is carrier CGNAT and NOT reachable from outside
+// 100.64.0.0/10 -- carrier-grade NAT. The laptop cannot see this; the phone can.
+const isCgnat4 = h => {
+  const a = bareAddr(h)
+  if (!net.isIPv4(a)) return false
+  const [x, y] = a.split('.').map(Number)
+  return x === 100 && y >= 64 && y <= 127
+}
+
+// public IPv4 -- 100.64/10 is CGNAT and NOT reachable from outside
 const isPublic4 = h => {
   const a = bareAddr(h)
   if (!net.isIPv4(a)) return false
@@ -150,10 +160,18 @@ const isPublic4 = h => {
   if (x === 172 && y >= 16 && y <= 31) return false
   if (x === 192 && y === 168) return false
   if (x === 169 && y === 254) return false
-  if (x === 100 && y >= 64 && y <= 127) return false
+  if (isCgnat4(a)) return false
   if (x >= 224) return false
   return true
 }
+
+// private IPv4 handed out by a phone hotspot (iPhone / Android / Windows)
+const HOTSPOT4 = /^(172\.20\.1[01]\.|192\.168\.4[23]\.|192\.168\.137\.|10\.42\.0\.)/
+const hotspotLike = h => HOTSPOT4.test(bareAddr(h))
+
+// interface names that are almost always virtual adapters
+const VIRTUAL_IFACE = /^(vethernet|vmware|virtualbox|vboxnet|docker|br-|veth|virbr|podman|cni|flannel|cali|kube|hyper-v|npcap|loopback|zt|tailscale|wg\d|tun\d|tap\d|utun|awdl|llw|anpi|bridge\d)/i
+const isVirtualIface = n => VIRTUAL_IFACE.test(String(n || ''))
 
 const isDialable = p => !!p && (isGlobal6(p.host) || isPublic4(p.host) || p.kind === 'dns')
 
@@ -179,14 +197,17 @@ const parseMa = s => {
 const addrRank = p => {
   if (!p) return 9
   if (p.kind === 'ip6') return isGlobal6(p.host) ? 0 : 3       // global v6 wins
+  if (p.kind === 'dns') return 1
   if (p.kind === 'ip4') return isPublic4(p.host) ? 1 : p.host === '127.0.0.1' ? 8 : 2
   return 4
 }
 
-function lanAddrs(id, port) {
+function lanAddrs(id, port, opts = {}) {
   const out = []
   if (!port) return out
-  for (const list of Object.values(os.networkInterfaces())) {
+  const all = !!opts.allIfaces
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    if (!all && isVirtualIface(name)) continue
     for (const i of list || []) {
       const a = bareAddr(i?.address || '')
       if (!a || i.internal || isLocalOnly(a)) continue
@@ -196,7 +217,7 @@ function lanAddrs(id, port) {
       out.push(toMa(a, port, id))
     }
   }
-  out.push(toMa('127.0.0.1', port, id))                    // same-machine testing
+  out.push(toMa('127.0.0.1', port, id))                    // last resort, filtered from invites
   const seen = new Set()
   return out
     .filter(m => { if (seen.has(m)) return false; seen.add(m); return true })
@@ -204,6 +225,20 @@ function lanAddrs(id, port) {
     .sort((a, b) => a.r - b.r || a.i - b.i)
     .map(x => x.m)
     .slice(0, 16)
+}
+
+// what may go into an invite / a peers list: no loopback, no link-local
+const invitable = addrs => (addrs || []).filter(m => { const p = parseMa(m); return !!p && !isLocalOnly(p.host) })
+
+// classify a set of local addresses so we can explain why hosting will fail
+function classifyAddrs(addrs) {
+  const ps = (addrs || []).map(parseMa).filter(Boolean)
+  const v6 = ps.filter(p => p.kind === 'ip6' && isGlobal6(p.host))
+  const pub4 = ps.filter(p => p.kind === 'ip4' && isPublic4(p.host))
+  const dns = ps.filter(p => p.kind === 'dns')
+  const cgnat4 = ps.filter(p => p.kind === 'ip4' && isCgnat4(p.host))
+  const priv4 = ps.filter(p => p.kind === 'ip4' && net.isIPv4(p.host) && !isPublic4(p.host) && !isCgnat4(p.host) && p.host !== '127.0.0.1')
+  return { v6, pub4, dns, cgnat4, priv4, dialable: v6.length + pub4.length + dns.length > 0 }
 }
 
 // ---------- invite ----------
@@ -251,6 +286,7 @@ const MAX_FRAME = 2 << 20
 const CHUNK = 32 << 10          // was 1200: ~27x fewer frames, seals, and syscalls
 const UDP_MAX = 1200            // only small frames go over UDP (no IP fragmentation)
 const MAX_CONNS = 64, MAX_CONNS_PER_IP = 8
+const MAX_DIAL = 8
 const HANDSHAKE_MS = 8000
 const MAGIC = Buffer.from('C3PU')
 
@@ -277,7 +313,7 @@ const unseal = (key, type, body) => {
 
 // ---------- mesh ----------
 class Mesh {
-  constructor(ident, { port, psk, advertise, lanOnly }) {
+  constructor(ident, { port, psk, advertise, lanOnly, allIfaces }) {
     this.id = ident.id
     this.peerId = { toString: () => this.id }
     this.wantPort = port
@@ -285,6 +321,7 @@ class Mesh {
     this.psk = psk
     this.advertise = advertise
     this.lanOnly = !!lanOnly
+    this.allIfaces = !!allIfaces
     this.conns = new Set()
     this.events = new Map()
     this.stopped = false
@@ -308,15 +345,27 @@ class Mesh {
   peerIds() { const s = new Set(); for (const c of this.conns) if (c.ready && c.peerId) s.add(c.peerId); return s }
   peerCount() { return this.peerIds().size }
   getConnections() { return [...this.conns].filter(c => c.ready).map(c => ({ remotePeer: { toString: () => c.peerId } })) }
+  // recomputed on every call: temporary IPv6 and network switches must not go stale
   addrs() {
-    let out = lanAddrs(this.id, this.port)
+    const out = []
     const adv = String(this.advertise || '').trim()
     if (adv) {
       const m = adv.match(/^(?:\[([^\]]+)\]|([^:/]+)):(\d+)$/)
       if (m && Number(m[3]) > 0) out.push(toMa(m[1] || m[2], Number(m[3]), this.id))
     }
-    if (this.lanOnly) out = out.filter(m => !isDialable(parseMa(m)))
-    return [...new Set(out)].slice(0, 16)
+    out.push(...lanAddrs(this.id, this.port, { allIfaces: this.allIfaces }))
+    const seen = new Set()
+    let list = out.filter(m => {
+      if (!parseMa(m) || seen.has(m)) return false
+      seen.add(m)
+      return true
+    })
+    if (this.lanOnly) list = list.filter(m => !isDialable(parseMa(m)))
+    return list
+      .map((m, i) => ({ m, i, r: addrRank(parseMa(m)) }))
+      .sort((a, b) => a.r - b.r || a.i - b.i)
+      .map(x => x.m)
+      .slice(0, 16)
   }
 
   async start() {
@@ -1005,7 +1054,44 @@ async function connect() {
   if (!Number.isInteger(wantPort) || wantPort < 0 || wantPort > 65535) die('Bad port.')
   const advertise = String(flag('advertise') ?? cfg0.advertise ?? '').trim()
   const psk = crypto.createHash('sha256').update('c3psk\0').update(name).update('\0').update(sKey).digest()
-  const mesh = new Mesh(ident, { port: wantPort, psk, advertise, lanOnly: has('lan-only') })
+  const mesh = new Mesh(ident, {
+    port: wantPort, psk, advertise,
+    lanOnly: has('lan-only'),
+    allIfaces: has('all-ifaces') || cfg0.allIfaces === true
+  })
+
+  // --- host-side reachability check, before anything is dialled ---
+  const claimed = !!advertise
+  const selfAddrs = mesh.addrs()
+  const cls = classifyAddrs(selfAddrs)
+  if (!JOIN && !cls.dialable && !claimed) {
+    ui.warn('this machine cannot host a cross-network session')
+    for (const p of cls.cgnat4) console.error(`    /ip4/${p.host}   carrier-grade NAT (outbound only)`)
+    for (const p of cls.priv4) {
+      const why = hotspotLike(p.host) ? 'phone hotspot subnet (private)' : 'private address (same LAN only)'
+      console.error(`    /ip4/${p.host}   ${why}`)
+    }
+    if (!cls.cgnat4.length && !cls.priv4.length) console.error('    (no non-loopback addresses at all)')
+    console.error('  a peer on another network cannot dial any of these: it will hang and')
+    console.error('  then fail after 45s. start the session from the peer that has a global')
+    console.error('  IPv6 or a public IPv4 address, or keep both peers on the same network.')
+    console.error('  (this is fine if both peers really are on the same LAN.)')
+  } else if (!JOIN && claimed && !cls.dialable) {
+    ui.say(`advertising ${advertise} -- assuming it is reachable from outside`)
+  }
+
+  // --- joiner-side: is this invite even worth dialling? ---
+  if (JOIN) {
+    const hostAddrs = JOIN.addrs.length ? JOIN.addrs : [JOIN.ma]
+    if (!classifyAddrs(hostAddrs).dialable) {
+      ui.warn('this invite carries no globally routable address')
+      console.error('  the host looks like it is on a LAN, a phone hotspot, or behind NAT,')
+      console.error('  so it is only reachable from the same network. if you are on another')
+      console.error('  network, the host must start from a machine with global IPv6 or a')
+      console.error('  public IPv4. killing this after 45s of retries either way.')
+    }
+  }
+
   await mesh.start()
   const port = mesh.port
   const kind = cfg0.backend === 'git' || cfg0.backend === 'none'
@@ -1014,6 +1100,7 @@ async function connect() {
   const cfg = { ...cfg0, name, port, backend: kind }      // dir is per-run, never stored
   delete cfg.dir
   if (advertise) cfg.advertise = advertise
+  else delete cfg.advertise
   atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2), 0o600)
   loadIgnores()
   backend = makeBackend(cfg)
@@ -1033,32 +1120,54 @@ async function connect() {
     resetToHead()
   }
 
-  const peers = new Set(readPeers(sdir))
-  if (JOIN) {
-    for (const m of JOIN.addrs) peers.add(m)              // every candidate: dialled in parallel
-    if (JOIN.ma) peers.add(JOIN.ma)
+  // --- peer bookkeeping: ranked, deduped, capped ---
+  const peers = new Set()
+  const savePeers = () => {
+    const arr = [...peers].map((a, i) => ({ a, i, p: parseMa(a) })).filter(x => x.p)
+    arr.sort((x, y) => addrRank(x.p) - addrRank(y.p) || x.i - y.i)
+    const out = []
+    const seen = new Set()
+    for (const x of arr) {
+      const k = x.p.host + ':' + x.p.port
+      if (seen.has(k)) continue
+      seen.add(k)
+      out.push(x.a)
+      if (out.length >= 64) break
+    }
+    peers.clear()
+    for (const a of out) peers.add(a)
+    writePeers(sdir, out)
   }
-  if (flag('peer')) { const p = parseMa(flag('peer')); if (p) peers.add(flag('peer')) }
-  writePeers(sdir, [...peers])
   const addPeer = a => {
-    if (typeof a !== 'string' || a.length > 500) return
+    if (typeof a !== 'string' || a.length > 500) return false
     const p = parseMa(a)
-    if (!p || p.id === mesh.id || isLocalOnly(p.host)) return
-    if (peers.has(a) || peers.size >= 64) return
-    peers.add(a); writePeers(sdir, [...peers])
+    if (!p || p.id === mesh.id || isLocalOnly(p.host)) return false
+    if (peers.has(a)) return false
+    peers.add(a)
+    savePeers()
+    return true
   }
+  for (const a of readPeers(sdir)) addPeer(a)
+  if (JOIN?.ma) { peers.add(JOIN.ma); savePeers() }   // primary target may be loopback (two repos, one machine)
+  if (JOIN) for (const m of JOIN.addrs) addPeer(m)    // siblings: loopback / link-local dropped
+  if (flag('peer')) addPeer(flag('peer'))
+
   let leaving = false
   const dialPeers = () => {
     if (leaving) return
-    for (const a of readPeers(sdir)) if (!peers.has(a)) peers.add(a)
+    for (const a of readPeers(sdir)) addPeer(a)
     const live = mesh.peerIds()
-    let n = 0
+    const list = []
+    let i = 0
     for (const a of peers) {
-      if (n >= 8) break
       const p = parseMa(a)
-      if (!p || live.has(p.id)) continue
-      mesh.dial(a).catch(() => {}); n++
+      if (!p || p.id === mesh.id || live.has(p.id)) continue
+      list.push({ a, i: i++, r: addrRank(p) })
     }
+    // best 8 by rank, not the 8 oldest: virtual/private candidates must not crowd
+    // out the global IPv6 one after a few sessions have piled up in peers.json
+    list.sort((x, y) => x.r - y.r || x.i - y.i)
+    for (const x of list.slice(0, MAX_DIAL)) mesh.dial(x.a).catch(() => {})
   }
   const waitFor = async (ms, cond) => {
     const until = Date.now() + ms
@@ -1213,19 +1322,23 @@ async function connect() {
   })
   mesh.addEventListener('peer:disconnect', () => ui.set(`live -- ${mesh.peerCount()} peer(s)`))
 
+  // --- live address set: re-read on a timer so a rotated IPv6 is not stale ---
   const addrsFile = path.join(sdir, 'addrs.json')
-  const myAddrs = mesh.addrs()
+  let myAddrs = mesh.addrs()
   const writeAddrs = () => {
     try { atomicWrite(addrsFile, JSON.stringify({ id: mesh.id, addrs: myAddrs, port }), 0o600) } catch {}
   }
-
-  // security: this listener is now reachable from the whole internet when the
-  // machine has a global IPv6 or public IPv4 address.
-  const routable = myAddrs.map(parseMa).filter(isDialable)
-  if (routable.length) {
-    ui.warn(`listening on a globally routable address (${routable[0].host}) port ${port}`)
-    ui.warn('the invite is the password -- share it over a private channel, per session')
-    if (!has('lan-only')) ui.say('use --lan-only to keep the listener off the public internet')
+  const refreshAddrs = () => {
+    const next = mesh.addrs()
+    if (next.join('|') === myAddrs.join('|')) return false
+    const was = invitable(myAddrs).join('|')
+    myAddrs = next
+    writeAddrs()
+    if (invitable(next).join('|') !== was) {
+      ui.warn('network address changed -- any invite already printed is stale')
+      ui.say('run `node c3.js share` in another terminal for a fresh invite')
+    }
+    return true
   }
 
   ui.say(`root ${ROOT}${flag('dir') ? ' (--dir)' : ''} -- ${kind}`)
@@ -1249,18 +1362,20 @@ async function connect() {
   if (!started) startScan()
 
   writeAddrs()
-  addrsTimer = setInterval(writeAddrs, 5000)
+  addrsTimer = setInterval(refreshAddrs, 5000)
   if (had > 0) ui.say(`${restored ? 'resumed' : 'joined'} "${name}" -- ${files.size} files -- ${mesh.peerCount()} peer(s) -- ${kind}`)
   else ui.say(`started "${name}" -- ${files.size} files -- ${kind}`)
 
-  const host = pickHost(myAddrs)
+  const host = pickHost(invitable(myAddrs))
   if (host) {
     console.log('')
     console.log('  invite -- paste this into the other terminal:')
     console.log('')
-    console.log('  node c3.js join ' + makeInvite({ name, key: sKey, addrs: myAddrs, host: host.host, port: host.port, id: mesh.id }))
+    console.log('  node c3.js join ' + makeInvite({ name, key: sKey, addrs: invitable(myAddrs), host: host.host, port: host.port, id: mesh.id }))
     console.log('')
-  } else ui.warn('no reachable address; run with --advertise <host:port>')
+  } else if (!JOIN) {
+    ui.warn('no address to put in an invite -- see the reachability warning above')
+  }
 
   tick = setInterval(() => {
     const p = mesh.peerCount()
@@ -1284,11 +1399,14 @@ function shareCmd() {
   let addrs = []
   try { addrs = JSON.parse(fs.readFileSync(path.join(sdir, 'addrs.json'), 'utf8')).addrs ?? [] } catch {}
   addrs = addrs.map(parseMa).filter(p => p && p.id === me).map(p => toMa(p.host, p.port, me))
-  if (!addrs.length) addrs = lanAddrs(me, Number(cfg.port || 8443))
-  const host = pickHost(addrs)
+  if (!addrs.length) addrs = lanAddrs(me, Number(cfg.port || 8443), { allIfaces: has('all-ifaces') })
+  const usable = invitable(addrs)
+  const host = pickHost(usable)
   if (!host) die('No reachable address. Run with --advertise <host:port>.')
+  const cls = classifyAddrs(usable)
+  if (!cls.dialable) ui.warn('this invite is LAN-only -- cross-network peers cannot dial it')
   ui.clear()
-  console.log('\n  node c3.js join ' + makeInvite({ name: cfg.name, key, addrs, host: host.host, port: host.port, id: me }) + '\n')
+  console.log('\n  node c3.js join ' + makeInvite({ name: cfg.name, key, addrs: usable, host: host.host, port: host.port, id: me }) + '\n')
 }
 function peerCmd() {
   const cfg = readConfig() ?? die('No config.')
@@ -1340,7 +1458,8 @@ const usage = `usage: node c3.js [command]
   share             print the invite line again
   config            change port / backend / advertise
   peer <ma>         add a peer address manually
-Flags: --dir <p>  --port <n>  --advertise <host:port>  --lan-only  --prune  --yes  --force-push
+Flags: --dir <p>  --port <n>  --advertise <host:port>  --lan-only  --all-ifaces
+       --prune  --yes  --force-push
 `
 if (cmd === 'join') await joinCmd()
 else if (cmd === 'share') shareCmd()
