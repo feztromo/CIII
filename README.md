@@ -8,7 +8,7 @@
 
 CIII is a peer-to-peer tool for collaborative coding. It uses Yjs to synchronize files between teammates on Linux, as well on Windows and macOS.
 
-There is no dedicated host! Peers connect directly, but one participant usually needs a reachable endpoint when connecting across different networks.
+There is no dedicated host! Peers connect directly, but one participant usually needs a reachable endpoint when connecting across different networks. An easy fix to this is to use something like Tailscale or ZeroTier.
 
 
 ## Quick Start
