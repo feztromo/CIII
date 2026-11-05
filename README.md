@@ -18,7 +18,7 @@ Clone C3 **inside your project directory**, as a `c3/` subfolder. C3 always trea
 
 ```bash
 # From your project directory
-git clone https://github.com/feztromo/c3.git c3
+git clone https://github.com/feztromo/CIII.git c3
 echo c3/ >> .gitignore
 
 cd c3
