@@ -56,15 +56,44 @@ winget install --id Cloudflare.cloudflared
 brew install cloudflared
 ```
 
-## Start
+## Quick start
 
-Place `c3/` inside your project and keep it out of Git if you use it:
+Clone CIII into your project:
+
+```bash
+git clone https://github.com/feztromo/CIII.git c3
+cd c3
+npm install
+```
+
+Keep `c3/` out of Git if you use it:
 
 ```bash
 echo c3/ >> .gitignore
-cd c3
-npm install
+```
+
+Run inside `c3/`:
+
+```bash
 node c3.js
+```
+
+A typical project tree looks like this:
+
+```
+my-project/
+├── .git/
+├── .gitignore
+├── src/
+│   └── main.js
+├── package.json
+└── c3/                 <-- CIII lives here
+    ├── c3.js
+    ├── package.json
+    └── .c3/            <-- Created automatically after starting a session
+        ├── config.json
+        ├── identity.json
+        └── s/
 ```
 
 C3 uses the parent of `c3/` as the project root. Use `--dir` for another root:
