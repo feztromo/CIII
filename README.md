@@ -163,7 +163,7 @@ C3 may warn that the VPN address looks private or carrier-grade NAT, but that is
 
 ## Flags
 
-`--dir <path>`, `--port <n>`, `--advertise <host:port>`, `--tunnel cloudflare|named`, `--tunnel-host <host>`, `--lan-only`, `--all-ifaces`, `--prune`, `--yes`, `--force-push`, `--help`
+`--dir <path>`, `--port <n>`, `--advertise <host:port>`, `--tunnel cloudflare|named`, `--tunnel-host <host>`, `--lan-only`, `--all-ifaces`, `--prune`, `--yes`, `--force-push`, `--autosave <seconds>`, `--help`
 
 Flags may come before the command.
 
@@ -181,6 +181,12 @@ Flags may come before the command.
 
 Extra ignore patterns go in `c3/.c3/ignore`, one per line. `*` and `?` wildcards are supported.
 
+## Autosave
+
+Synced changes are written to disk immediately (typically within 40 ms). A background autosave also retries any files that are still dirty every second, so a temporarily locked file is saved as soon as it becomes writable. Every document update is appended to the local session log immediately, and a full state snapshot is written once changes have been idle for the autosave interval.
+
+Change the interval with `--autosave <seconds>` (for example `--autosave 0.5`); `--autosave 0` disables the periodic retry/snapshot timer (immediate writes still happen). This is local saving, not a Git commit.
+
 ## Publishing
 
 With the Git backend, the last peer leaving is asked to commit and push. `--yes` skips the prompt. `--force-push` permits a configured force push.
@@ -194,7 +200,7 @@ With the Git backend, the last peer leaving is asked to commit and push. `--yes`
 - Initial seed: 10,000 files / 200 MB
 - Symlinks are never followed
 - Files containing NUL bytes are treated as binary
-- Indirect sync: roughly 8 seconds per hop
+- Indirect sync: roughly 2 seconds per hop
 
 ## Troubleshooting
 

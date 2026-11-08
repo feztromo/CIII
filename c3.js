@@ -8,7 +8,7 @@
 // Only the host needs cloudflared.
 import * as Y from 'yjs'
 import readline from 'node:readline/promises'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -91,12 +91,22 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 const mkdirp = (d, m) => { try { fs.mkdirSync(d, { recursive: true, mode: m }) } catch { } }
 const atomicWrite = (f, d, mode = 0o600) => {
   const t = f + '.tmp-' + process.pid + '-' + crypto.randomBytes(4).toString('hex')
-  fs.writeFileSync(t, d, { mode }); fs.renameSync(t, f)
+  try { fs.writeFileSync(t, d, { mode }); fs.renameSync(t, f) }
+  catch (e) { try { fs.rmSync(t, { force: true }) } catch { }; throw e }
   try { fs.chmodSync(f, mode) } catch { }
 }
 const sigOf = st => st.mtimeMs + ':' + st.size
 const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
 const GIT_TIMEOUT = 120000
+// Autosave interval: retries dirty file writes and delays the full state snapshot.
+// Incremental updates are appended to the oplog immediately, so 0 is still crash-safe.
+const AUTOSAVE_MS = (() => {
+  const v = flag('autosave')
+  if (v === undefined) return 1000
+  const s = Number(v)
+  if (!Number.isFinite(s) || s < 0 || s > 3600) die('Bad --autosave: use seconds (0 disables).')
+  return s === 0 ? 0 : Math.max(100, Math.round(s * 1000))
+})()
 const git = (...a) => execFileSync('git', a, { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 28, timeout: GIT_TIMEOUT, env, stdio: 'pipe' }).trim()
 const gitOk = (...a) => { try { return git(...a) } catch { return null } }
 
@@ -764,7 +774,8 @@ class Mesh {
 const doc = new Y.Doc()
 const files = doc.getMap('files'), texts = doc.getMap('texts'), blobs = doc.getMap('blobs')
 const touched = new Set(), idToPath = new Map(), lastWritten = new Map()
-const diskMeta = new Map(), pendingWrites = new Map(), missing = new Map()
+const diskMeta = new Map(), pendingWrites = new Map(), goneChecks = new Map()
+const dirtyDocs = new Set()
 const remote = tx => tx.origin !== 'disk' && tx.origin !== 'restore'
 const asBuf = u => Buffer.from(u.buffer, u.byteOffset, u.byteLength)
 let backend = null
@@ -815,6 +826,7 @@ function safeAbs(rel) {
 function dropFile(rel) {
   const s = safeAbs(rel)
   if (!s || symlinkEscape(s.abs)) return
+  dirtyDocs.delete(s.norm)
   try { fs.unlinkSync(s.abs) } catch { }
 }
 function walkFs() {
@@ -838,6 +850,16 @@ function walkTree() {
     return out.toString('utf8').split('\0').filter(Boolean).filter(rel => !shouldIgnore(rel)).slice(0, 50000)
   }
   return walkFs()
+}
+// Async variant for the background scan: keeps the event loop (and sync) responsive in large repos.
+function walkTreeAsync() {
+  if (backend?.kind !== 'git') return Promise.resolve(walkFs())
+  return new Promise(res => {
+    execFile('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: ROOT, encoding: 'buffer', maxBuffer: 1 << 28, timeout: GIT_TIMEOUT, env }, (err, out) => {
+      if (err || !out) return res(walkFs())
+      try { res(out.toString('utf8').split('\0').filter(Boolean).filter(rel => !shouldIgnore(rel)).slice(0, 50000)) } catch { res(walkFs()) }
+    })
+  })
 }
 const isHi = c => c >= 0xd800 && c <= 0xdbff
 function applyDiff(t, next) {
@@ -886,35 +908,62 @@ function syncFromDisk(rel, seed = false) {
   }, 'disk')
 }
 function removeFromDoc(rel) {
+  dirtyDocs.delete(rel)
   doc.transact(() => {
     const entry = files.get(rel)
     if (!entry) return
     touched.add(rel); files.delete(rel); texts.delete(entry.id); blobs.delete(entry.id)
   }, 'disk')
 }
+// A missing path may just be an editor's atomic save (delete + rename), so confirm
+// briefly before broadcasting a delete.
+function noteGone(rel) {
+  if (!files.has(rel) || goneChecks.has(rel)) return
+  const t = setTimeout(() => {
+    goneChecks.delete(rel)
+    if (!files.has(rel)) return
+    const s = safeAbs(rel)
+    if (!s || shouldIgnore(s.norm)) return
+    let st; try { st = fs.statSync(s.abs) } catch { st = null }
+    if (st?.isFile()) {
+      if (pendingWrites.has(s.norm)) return
+      const sig = sigOf(st)
+      if (diskMeta.get(s.norm) !== sig) { diskMeta.set(s.norm, sig); syncFromDisk(s.norm) }
+      return
+    }
+    if (pendingWrites.has(s.norm)) return
+    diskMeta.delete(s.norm); lastWritten.delete(s.norm)
+    removeFromDoc(s.norm)
+  }, 100)
+  t.unref?.()
+  goneChecks.set(rel, t)
+}
 function writeToDisk(rawRel) {
   const s = safeAbs(rawRel)
-  if (!s || shouldIgnore(s.norm) || symlinkEscape(s.abs)) return
+  if (!s || shouldIgnore(s.norm) || symlinkEscape(s.abs)) { dirtyDocs.delete(rawRel); return }
+  const done = () => dirtyDocs.delete(s.norm)
   const entry = files.get(s.norm)
-  if (!entry) return
+  if (!entry) { done(); return }
   let data
   if (entry.bin) {
     const b = blobs.get(entry.id)
-    if (!b) return
+    if (!b) { done(); return }
     data = asBuf(b)
   } else data = Buffer.from(texts.get(entry.id)?.toString() ?? '', 'utf8')
-  if (data.length > MAX_FILE) return
+  if (data.length > MAX_FILE) { done(); return }
   const abs = s.abs
-  try { const cur = fs.readFileSync(abs); if (Buffer.compare(cur, data) === 0) return } catch { }
+  try { const cur = fs.readFileSync(abs); if (Buffer.compare(cur, data) === 0) { done(); return } } catch { }
   let mode = 0o644; try { mode = fs.statSync(abs).mode & 0o777 } catch { }
   try {
     fs.mkdirSync(path.dirname(abs), { recursive: true })
     atomicWrite(abs, data, mode)
     lastWritten.set(s.norm, Date.now())
     try { diskMeta.set(s.norm, sigOf(fs.statSync(abs))) } catch { }
+    done()
   } catch { }
 }
 function scheduleWrite(rel) {
+  dirtyDocs.add(rel)
   clearTimeout(pendingWrites.get(rel))
   pendingWrites.set(rel, setTimeout(() => { pendingWrites.delete(rel); writeToDisk(rel) }, 40))
 }
@@ -922,6 +971,7 @@ function flushWrites() {
   for (const [, t] of pendingWrites) clearTimeout(t)
   pendingWrites.clear()
   for (const rel of [...files.keys()]) writeToDisk(rel)
+  dirtyDocs.clear()
 }
 files.observe(ev => {
   for (const [k, change] of ev.keys) {
@@ -1066,7 +1116,7 @@ function sync(mesh, doc, onAddrs) {
   mesh.on('peer:connect', () => { sendVec(); sendAddrs() })
   mesh.on('peer:disconnect', () => { parts.clear(); liveBytes = 0 })
   doc.on('update', (u, origin) => { if (origin !== 'remote' && origin !== 'restore') sendUpd(u) })
-  const t = setInterval(() => { sendVec(); sendAddrs() }, 8000)
+  const t = setInterval(() => { sendVec(); sendAddrs() }, 2000)
   t.unref?.()
   sendVec(); sendAddrs()
 }
@@ -1260,10 +1310,16 @@ async function connect() {
     return cond()
   }
 
+  let snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null, autosaveTimer = null
   const stateFile = path.join(sdir, 'state.bin'), genFile = path.join(sdir, 'state.gen'), logFile = path.join(sdir, 'oplog')
   const appendLog = u => { try { const h = Buffer.allocUnsafe(4); h.writeUInt32BE(u.length, 0); fs.appendFileSync(logFile, Buffer.concat([h, Buffer.from(u)])) } catch { } }
   const snapshotNow = () => { try { atomicWrite(stateFile, Y.encodeStateAsUpdate(doc), 0o600); atomicWrite(genFile, backend.generation(), 0o600); fs.rmSync(logFile, { force: true }) } catch { } }
-  const scheduleSnapshot = () => { clearTimeout(snapTimer); snapTimer = setTimeout(snapshotNow, 5000) }
+  const scheduleSnapshot = () => {
+    if (!AUTOSAVE_MS) return
+    clearTimeout(snapTimer)
+    snapTimer = setTimeout(snapshotNow, AUTOSAVE_MS)
+    snapTimer.unref?.()
+  }
   const removeState = () => { for (const f of [stateFile, genFile, logFile]) try { fs.rmSync(f, { force: true }) } catch { } }
   function restoreState() {
     if (!fs.existsSync(stateFile)) return false
@@ -1294,12 +1350,25 @@ async function connect() {
   }
   sync(mesh, doc, addrs => { for (const a of addrs) addPeer(a); dialPeers() })
   doc.on('update', (u, origin) => { if (origin === 'restore') return; appendLog(u); scheduleSnapshot() })
+  // Ctrl+S-style autosave: writes usually land within 40 ms, this retries anything
+  // still dirty (locked file, transient permissions, missed event) on an interval.
+  if (AUTOSAVE_MS) {
+    autosaveTimer = setInterval(() => {
+      if (leaving || !dirtyDocs.size) return
+      for (const rel of [...dirtyDocs]) writeToDisk(rel)
+    }, AUTOSAVE_MS)
+    autosaveTimer.unref?.()
+  }
 
-  function scan() {
+  let scanning = false
+  async function scan() {
+    if (scanning || leaving) return
+    scanning = true
     try {
-      const list = walkTree(), present = new Set(list), now = Date.now()
+      const list = await walkTreeAsync(), present = new Set(list), now = Date.now()
+      if (leaving) return
       for (const rel of list) {
-        if (pendingWrites.has(rel) || (lastWritten.get(rel) ?? 0) > now - 1500) continue
+        if (pendingWrites.has(rel) || (lastWritten.get(rel) ?? 0) > now - 200) continue
         let st; try { st = fs.statSync(path.join(ROOT, rel)) } catch { continue }
         if (!st.isFile()) continue
         const sig = sigOf(st)
@@ -1307,23 +1376,20 @@ async function connect() {
         diskMeta.set(rel, sig); syncFromDisk(rel)
       }
       for (const rel of [...files.keys()]) {
-        if (present.has(rel)) { missing.delete(rel); continue }
+        if (present.has(rel)) continue
         if (shouldIgnore(rel) || pendingWrites.has(rel)) continue
-        if ((lastWritten.get(rel) ?? 0) > now - 3000) continue
-        const n = (missing.get(rel) || 0) + 1
-        if (n < 2) { missing.set(rel, n); continue }
-        missing.delete(rel); removeFromDoc(rel)
+        noteGone(rel)
       }
-    } catch { }
+    } catch { } finally { scanning = false }
   }
   function quick(rel) {
     if (!rel) return
     const s = safeAbs(rel)
     if (!s || shouldIgnore(s.norm)) return
+    let st; try { st = fs.statSync(s.abs) } catch { st = null }
+    if (!st || !st.isFile()) { noteGone(s.norm); return }
     const now = Date.now()
-    if (pendingWrites.has(s.norm) || (lastWritten.get(s.norm) ?? 0) > now - 500) return
-    let st; try { st = fs.statSync(s.abs) } catch { return }
-    if (!st.isFile()) return
+    if (pendingWrites.has(s.norm) || (lastWritten.get(s.norm) ?? 0) > now - 200) return
     const sig = sigOf(st)
     if (diskMeta.get(s.norm) === sig) return
     diskMeta.set(s.norm, sig); syncFromDisk(s.norm)
@@ -1332,11 +1398,14 @@ async function connect() {
   function startScan() {
     if (started) return
     started = true; scan()
+    const arm = ms => { clearInterval(scanTimer); scanTimer = setInterval(scan, ms); scanTimer.unref?.() }
+    let watching = false
     try {
       watcher = fs.watch(ROOT, { recursive: true }, (_e, f) => { if (f) quick(String(f).split(path.sep).join('/')) })
-      watcher.on('error', () => { })
-    } catch { ui.warn('instant watching unavailable -- polling only') }
-    scanTimer = setInterval(scan, 8000)
+      watcher.on('error', () => { try { watcher.close() } catch { }; watcher = null; if (!leaving) arm(1000) })
+      watching = true
+    } catch { ui.warn('instant watching unavailable -- polling every second') }
+    arm(watching ? 2000 : 1000)
   }
   function seedFromDisk() {
     const seed = walkTree()
@@ -1354,12 +1423,11 @@ async function connect() {
     const a = (await rl.question(`Publish ${n} changed path(s) to archive? [y/N] `)).trim().toLowerCase()
     rl.close(); return a === 'y' || a === 'yes'
   }
-  let snapTimer = null, scanTimer = null, tick = null, dialTimer = null, addrsTimer = null
   async function leave() {
     if (leaving) return
     leaving = true
     ui.stop(); ui.setActive(false); ui.done = true
-    for (const t of [scanTimer, snapTimer, tick, dialTimer, addrsTimer]) { clearInterval(t); clearTimeout(t) }
+    for (const t of [scanTimer, snapTimer, tick, dialTimer, addrsTimer, autosaveTimer]) { clearInterval(t); clearTimeout(t) }
     try { watcher?.close() } catch { }
     try { tunnelChild?.kill() } catch { }
     flushWrites(); snapshotNow(); ui.clear()
@@ -1487,7 +1555,7 @@ async function connect() {
   tick = setInterval(() => {
     ui.setActive(mesh.peerCount() > 0)
     ui.set(liveMsg())
-  }, 2000)
+  }, 1000)
   process.on('SIGINT', leave); process.on('SIGTERM', leave)
 }
 
@@ -1576,6 +1644,7 @@ const usage = `Usage: node c3.js [command]
   peer <ma>         Add a peer address manually
 Flags: --dir <p>  --port <n>  --advertise <host:port>  --tunnel cloudflare|named
        --tunnel-host <host>  --lan-only  --all-ifaces  --prune  --yes  --force-push
+       --autosave <seconds>  (autosave interval, default 1; 0 disables)
 `
 if (cmd === 'help' || has('help')) { console.log(usage); process.exit(0) }
 else if (cmd === 'join') await joinCmd()
